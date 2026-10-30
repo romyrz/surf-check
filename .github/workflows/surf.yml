@@ -1,7 +1,8 @@
 name: Surf check
 on:
   schedule:
-    - cron: "0 5 * * *"   # tous les jours à 5h UTC
+    - cron: "0 6 * * *"   # 8h à Paris en été (UTC+2)
+    - cron: "0 7 * * *"   # 8h à Paris en hiver (UTC+1)
   workflow_dispatch:
 permissions:
   contents: read
@@ -11,7 +12,27 @@ concurrency:
   group: pages
   cancel-in-progress: true
 jobs:
+  # Choisit le bon des deux créneaux selon l'heure d'été / d'hiver,
+  # pour que le rapport soit toujours fait à 8h heure de Paris.
+  horaire:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.when.outputs.go }}
+    steps:
+      - id: when
+        run: |
+          offset=$(TZ=Europe/Paris date +%z)
+          go=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "0 6 * * *" ] && [ "$offset" != "+0200" ]; then go=false; fi
+            if [ "${{ github.event.schedule }}" = "0 7 * * *" ] && [ "$offset" != "+0100" ]; then go=false; fi
+          fi
+          echo "Décalage Paris : $offset, lancement : $go"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
   check:
+    needs: horaire
+    if: needs.horaire.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment:
