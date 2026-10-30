@@ -31,7 +31,16 @@ SPOT = {
     "max_wind_kn": 22,
     "hours": (7, 20),                 # heures affichées (heure locale)
     "tz": "Europe/Paris",
+    "marc_zone": "7032_2",            # zone MARC Ifremer Quiberon / Ria d’Etel
+    "marc_days": 6,                   # cartes MARC disponibles sur 6 jours
 }
+MARC_URL = ("https://marc.ifremer.fr/resultats/vagues/modeles_atlantique_nord/(variable)/hs/"
+            "(typevisu)/map/(zoneid)/{zone}/(date)/{date}/(type)/canvas#appTop")
+
+
+def marc_link(lt, s=SPOT):
+    """Lien vers la carte MARC (hauteur de vagues) à l’heure locale lt."""
+    return MARC_URL.format(zone=s["marc_zone"], date=f"{lt:%Y%m%d_%H}0000")
 BREST = (48.30, -4.80)                # référence officielle des coefficients
 U_BREST = 6.10                        # marnage (m) correspondant au coef 100
 
@@ -116,6 +125,59 @@ def merge(forecasts):
         wind_done |= "WINDSPD" in fc
         wave_done |= "HTSGW" in fc or "SWELL1" in fc
     return dict(sorted(merged.items()))
+
+# =============================================================== CARTES MARC (IFREMER)
+
+
+def capture_marc(slots, out_dir, s=SPOT, debug=False):
+    """Ouvre la page MARC de chaque heure dans un navigateur sans écran et
+    photographie la carte (dessinée dans un <canvas>). Renvoie {heure locale: fichier}."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("Playwright absent : cartes MARC ignorées (pip install playwright).")
+        return {}
+    os.makedirs(out_dir, exist_ok=True)
+    for f in os.listdir(out_dir):                       # on repart de zéro à chaque rapport
+        if f.endswith((".jpg", ".png")):
+            os.remove(os.path.join(out_dir, f))
+    done, failures = {}, 0
+    biggest = """() => { const c = [...document.querySelectorAll('canvas')]
+        .filter(x => x.width > 300 && x.height > 200)
+        .sort((a, b) => b.width * b.height - a.width * a.height); return c[0] || null; }"""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1400, "height": 1100},
+                                locale="fr-FR", timezone_id=s["tz"])
+        for lt in slots:
+            name = f"{lt:%Y%m%d_%H}.jpg"
+            path = os.path.join(out_dir, name)
+            try:
+                page.goto(marc_link(lt, s), wait_until="load", timeout=60000)
+                page.wait_for_function(f"({biggest})() !== null", timeout=30000)
+                page.wait_for_timeout(2500)              # laisse le temps au dessin de se terminer
+                page.evaluate_handle(biggest).as_element().screenshot(
+                    path=path, type="jpeg", quality=80)
+                if os.path.getsize(path) < 8000:          # carte vide ou pas encore dessinée
+                    os.remove(path)
+                    raise RuntimeError("carte vide")
+                done[lt] = name
+                if debug:
+                    print(f"  MARC {lt:%d/%m %Hh} : ok")
+            except Exception as e:
+                failures += 1
+                print(f"  MARC {lt:%d/%m %Hh} : échec ({str(e).splitlines()[0][:120]})")
+                if failures == 1:                         # capture de diagnostic de la page entière
+                    try:
+                        page.screenshot(path=os.path.join(out_dir, "_diagnostic.png"), full_page=True)
+                    except Exception:
+                        pass
+                if failures >= 5 and not done:            # le site ne répond pas : on arrête
+                    print("  MARC indisponible, cartes ignorées pour ce rapport.")
+                    break
+        browser.close()
+    print(f"Cartes MARC : {len(done)}/{len(slots)} récupérées")
+    return done
 
 # =============================================================== MARÉES
 
@@ -320,6 +382,23 @@ ICON = {
     "ok": '<svg class="ic ok" viewBox="0 0 40 40" aria-label="Correct"><path d="M5 27c3.5 0 5-3 8.5-3s5 3 8.5 3 5-3 8.5-3 4 2 5 2.5"/><path d="M7 21c0-8 6-14 14-14 5 0 9 3 9 7-3-2-7-1.5-8 1.5-1.2 3.5 2 6 6 5.5"/></svg>',
     "nul": '<svg class="ic nul" viewBox="0 0 40 40" aria-label="Nul"><path d="M11 11l18 18M29 11L11 29"/></svg>',
 }
+MAP_ICON = ('<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" '
+            'stroke-linejoin="round"><path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2z"/><path d="M9 4v14M15 6v14"/></svg>')
+VIEWER_JS = """<script>
+document.querySelectorAll('.mbtn').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var f = document.getElementById(b.dataset.target);
+    if (!f) return;
+    f.querySelector('img').src = b.dataset.src;
+    f.querySelector('.mh').textContent = b.dataset.h;
+    f.querySelector('a').href = b.dataset.href;
+    document.querySelectorAll('.mbtn[data-target="' + b.dataset.target + '"]').forEach(function (x) {
+      x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
+    });
+    f.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  });
+});
+</script>"""
 LABEL = {"top": "Top", "go": "GO", "ok": "Correct", "nul": "Nul"}
 
 CSS = """
@@ -364,6 +443,13 @@ tr.sc td{font-size:.8rem;color:var(--muted);padding-top:0}
 td.top{background:color-mix(in srgb,var(--top) 14%,transparent)}
 td.go{background:color-mix(in srgb,var(--go) 12%,transparent)}
 td.ok{background:color-mix(in srgb,var(--ok) 12%,transparent)}
+.marc{color:var(--go);display:inline-flex;padding:4px;border-radius:6px;border:0;background:none;cursor:pointer;font:inherit}
+.marc:hover,.marc:focus-visible{background:color-mix(in srgb,var(--go) 15%,transparent);outline:none}
+.marc[aria-pressed="true"]{background:var(--go);color:var(--card)}
+.marcview{margin:12px 0 0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;max-width:770px}
+.marcview img{display:block;width:100%;height:auto;border-radius:4px;background:#fff}
+.marcview figcaption{color:var(--muted);font-size:.9rem;margin-top:8px}
+.marcview figcaption a{color:var(--go)}
 .ar{display:inline-block;font-size:1rem;line-height:1}
 .off{color:var(--off)}.on{color:var(--on)}.side-shore{color:var(--side)}
 small{color:var(--muted)}
@@ -382,7 +468,8 @@ def fmt(v, f="{:.0f}"):
     return "–" if v is None else f.format(v)
 
 
-def render_html(days, tides_by_day, s=SPOT, demo=False):
+def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="marc"):
+    marc = marc or {}
     tz = ZoneInfo(s["tz"])
     now = datetime.now(tz)
     e = html.escape
@@ -453,14 +540,39 @@ def render_html(days, tides_by_day, s=SPOT, demo=False):
             cells.append(f'<td class="{cls}">{arrow(wd)} <small class="{cls}">{k.replace("-shore", "")}</small></td>')
         row("Dir. vent", cells)
         row("Marée", [f"<td>{('↗ ' if h['tide']['rising'] else '↘ ') + h['tide']['label']}</td>" if h["tide"] else "<td>–</td>" for h in hours])
+        viewer = ""
+        if (day - now.date()).days < s["marc_days"]:
+            vid = f"m{day:%m%d}"
+            with_img = [h for h in hours if h["t"] in marc]
+            cells = []
+            for h in hours:
+                link = e(marc_link(h["t"], s))
+                if h["t"] in marc:
+                    cells.append(f'<td><button type="button" class="marc mbtn" data-target="{vid}" '
+                                 f'data-src="{marc_dir}/{marc[h["t"]]}" data-h="{h["t"]:%H}h" data-href="{link}" '
+                                 f'aria-label="Voir la carte de {h["t"]:%H}h">{MAP_ICON}</button></td>')
+                else:
+                    cells.append(f'<td><a class="marc" href="{link}" target="_blank" rel="noopener" '
+                                 f'aria-label="Carte MARC de {h["t"]:%H}h">{MAP_ICON}</a></td>')
+            row("Carte MARC", cells)
+            if with_img:
+                best = [h for h in with_img if h["v"] == v] or with_img
+                first = max(best, key=lambda h: h["score"])
+                viewer = (f'<figure class="marcview" id="{vid}"><img src="{marc_dir}/{marc[first["t"]]}" '
+                          f'alt="Carte MARC des vagues" loading="lazy" width="748" height="576">'
+                          f'<figcaption>Hauteur et direction des vagues à <span class="mh">{first["t"]:%H}h</span>. '
+                          f'Clique sur une icône de carte du tableau pour changer d’heure. '
+                          f'<a href="{e(marc_link(first["t"], s))}" target="_blank" rel="noopener">Ouvrir sur MARC</a>'
+                          f'</figcaption></figure>')
         row("Coef", [f"<td>{h['coef'] if h['coef'] else '–'}</td>" for h in hours])
         row("Air (°C)", [f"<td>{fmt(r.get('TMP'))}</td>" for r in R])
         row("Nuages (%)", [f"<td>{fmt(r.get('TCDC'))}</td>" for r in R])
-        out.append("</tbody></table></div></section>")
+        out.append("</tbody></table></div>" + viewer + "</section>")
 
     out.append("<footer>Vent, houle et météo : Windguru. Marées, coefficients (calculés depuis Brest) "
-               "et température de l’eau : Open-Meteo, modèles DWD, valeurs indicatives.</footer>"
-               "</main></body></html>")
+               "et température de l’eau : Open-Meteo, modèles DWD, valeurs indicatives. "
+               "Cartes de vagues : MARC, Ifremer.</footer>"
+               "</main>" + VIEWER_JS + "</body></html>")
     return "\n".join(out), summary
 
 
@@ -517,6 +629,7 @@ def main():
     ap.add_argument("--out", default="rapport.html")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--marc", action="store_true", help="photographier les cartes MARC (Ifremer)")
     a = ap.parse_args()
     tz = ZoneInfo(SPOT["tz"])
 
@@ -532,7 +645,12 @@ def main():
         tides = get_tides(SPOT, tz, a.debug)
 
     days, tides_by_day = build_days(merge(forecasts), tides)
-    page, summary = render_html(days, tides_by_day, demo=a.demo)
+    marc = {}
+    if a.marc:
+        today = datetime.now(tz).date()
+        slots = [h["t"] for d, hs in days.items() if (d - today).days < SPOT["marc_days"] for h in hs]
+        marc = capture_marc(slots, os.path.join(os.path.dirname(a.out) or ".", "marc"), debug=a.debug)
+    page, summary = render_html(days, tides_by_day, demo=a.demo, marc=marc)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(page)
