@@ -1,0 +1,27 @@
+name: Surf check
+on:
+  schedule:
+    - cron: "0 5 * * *"   # tous les jours à 5h UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python windguru_surf.py --out docs/index.html --debug
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Publier le rapport (GitHub Pages, dossier docs/)
+        run: |
+          git config user.name "surf-bot"
+          git config user.email "surf-bot@users.noreply.github.com"
+          git add docs/index.html
+          git commit -m "Rapport surf $(date +%F)" || echo "Rien de neuf"
+          git push
