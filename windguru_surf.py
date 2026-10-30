@@ -12,6 +12,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -31,11 +32,10 @@ SPOT = {
     "max_wind_kn": 22,
     "hours": (7, 20),                 # heures affichées (heure locale)
     "tz": "Europe/Paris",
-    # True = utiliser uniquement les modèles de l’onglet affiché par défaut sur Windguru
-    # (onglet « WG »), pour voir exactement les mêmes chiffres que sur le site.
-    "default_tab_only": True,
-    # Pour imposer d’autres modèles : leurs numéros id_model (visibles dans le journal), ex. [3, 84].
-    "models": [],
+    # Modèles Windguru : par nom (tel qu’affiché dans le journal) ou par numéro id_model.
+    "main_model": "WG",          # source de base : vagues, température, nuages, et vent après AROME
+    "wind_first": ["AROME"],     # vent prioritaire tant qu’il couvre l’heure (environ 2 jours)
+    "exclude": ["GFS 13"],       # jamais utilisés
     "marc_zone": "7032_2",            # zone MARC Ifremer Quiberon / Ria d’Etel
     "marc_days": 6,                   # cartes MARC disponibles sur 6 jours
 }
@@ -105,33 +105,60 @@ def model_names(obj, names=None):
 MODEL_NAMES = {}
 
 
+def model_matches(m, key):
+    """key = numéro id_model ou nom (« WG », « AROME », « GFS 13 »...)."""
+    if isinstance(key, int) or str(key).isdigit():
+        return m == int(key)
+    name = MODEL_NAMES.get(m, "")
+    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(str(key))}(?![A-Za-z0-9])", name, re.I))
+
+
+ROLES = {"main": [], "wind": []}      # modèles retenus pour chaque rôle, dans l’ordre
+
+
 def fetch_windguru(spot_id, debug=False, s=SPOT):
     spot = wg_get({"q": "forecast_spot", "id_spot": spot_id})
     models = find_model_ids(spot)
     MODEL_NAMES.update(model_names(spot))
     tabs = spot.get("tabs") if isinstance(spot, dict) else None
-    if debug and isinstance(tabs, list):
-        for i, tab in enumerate(tabs):
-            ids = find_model_ids(tab)
-            print(f"Onglet Windguru {i}{' (par défaut)' if i == 0 else ''} : "
-                  + ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in ids))
-    if s.get("models"):
-        prio = [m for m in s["models"] if m in models]
-        models = prio
-    elif s.get("default_tab_only") and isinstance(tabs, list) and tabs:
-        first = find_model_ids(tabs[0])
-        if first:
-            models = first
-        elif debug:
-            print("Onglet par défaut vide : tous les modèles sont utilisés.")
-    elif debug and not isinstance(tabs, list):
-        print("Structure des onglets non reconnue : tous les modèles sont utilisés.")
     if debug:
-        print("Modèles Windguru (ordre de priorité) :")
+        print("Modèles Windguru disponibles :")
         for m in models:
             print(f"  {m} : {MODEL_NAMES.get(m, '(nom inconnu)')}")
+        if isinstance(tabs, list):
+            for i, tab in enumerate(tabs):
+                print(f"  onglet {i} : {find_model_ids(tab)}")
+
+    excluded = [m for m in models if any(model_matches(m, k) for k in s.get("exclude", []))]
+    for k in s.get("exclude", []):
+        if not any(model_matches(m, k) for m in models):
+            print(f"Attention : modèle à exclure « {k} » introuvable par son nom "
+                  f"(indique plutôt son numéro dans \"exclude\").")
+    usable = [m for m in models if m not in excluded]
+
+    main = [m for m in usable if model_matches(m, s.get("main_model", "WG"))]
+    if not main and isinstance(tabs, list) and tabs:      # nom introuvable : onglet par défaut
+        main = [m for m in find_model_ids(tabs[0]) if m in usable]
+        print(f"« {s.get('main_model')} » introuvable par son nom : onglet par défaut utilisé {main}.")
+    wind = [m for k in s.get("wind_first", []) for m in usable if model_matches(m, k)]
+    for k in s.get("wind_first", []):
+        if not any(model_matches(m, k) for m in usable):
+            print(f"Attention : modèle de vent « {k} » introuvable (indique son numéro dans \"wind_first\").")
+    # vagues : on prend aussi les modèles de vagues de l’onglet principal s’ils sont séparés
+    if isinstance(tabs, list):
+        for tab in tabs:
+            ids = find_model_ids(tab)
+            if any(m in main for m in ids):
+                main += [m for m in ids if m in usable and m not in main]
+    ROLES["main"], ROLES["wind"] = main, wind
+    if debug:
+        names = lambda ms: ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in ms) or "aucun"
+        print(f"Exclus : {names(excluded)}")
+        print(f"Vent prioritaire : {names(wind)}")
+        print(f"Modèle principal : {names(main)}")
+
     out = {}
-    for m in models:
+    for m in dict.fromkeys(wind + main):
         try:
             d = wg_get({"q": "forecast", "id_model": m, "id_spot": spot_id})
             fc = d.get("fcst", d)
@@ -141,8 +168,7 @@ def fetch_windguru(spot_id, debug=False, s=SPOT):
                     print(f"  {m}: {len(fc['hours'])} pas, "
                           f"{[k for k, v in fc.items() if isinstance(v, list)]}")
         except Exception as e:
-            if debug:
-                print(f"  {m}: échec ({e})")
+            print(f"  {m}: échec ({e})")
     return out
 
 
@@ -159,44 +185,56 @@ def to_series(fc):
 WAVE_KEYS = ("HTSGW", "PERPW", "DIRPW", "SWELL", "SWPER", "SWDIR", "WV")
 
 
+WIND_KEYS = ("WINDSPD", "GUST", "WINDDIR")
+
+
 def merge(forecasts, debug=False):
-    """Fusionne les modèles heure par heure, dans l’ordre de Windguru (le plus précis d’abord).
-    Pour chaque heure, le vent/la météo viennent du premier modèle qui a du vent à cette heure,
-    la houle du premier modèle qui a des vagues à cette heure. Quand un modèle fin (ex. AROME)
-    s’arrête après 2 jours, le suivant prend le relais."""
-    # Un modèle de vagues contient aussi le vent qui le « pousse » (souvent un GFS grossier,
-    # au large) : on ne s’en sert pour le vent qu’en dernier recours.
-    is_wave = {m: ("HTSGW" in fc or "SWELL1" in fc) for m, fc in forecasts.items()}
-    order = sorted(forecasts, key=lambda m: is_wave[m])          # tri stable
-    series = [(m, to_series(forecasts[m])) for m in order]
-    merged = {}
-    used = defaultdict(lambda: [set(), set()])
-    for t in sorted({t for _, ser in series for t in ser}):
-        row = {}
-        wind_src = wave_src = None
-        for m, ser in series:
-            r = ser.get(t)
-            if not r:
-                continue
-            if wind_src is None and "WINDSPD" in r:
-                wind_src = m
+    """Assemble heure par heure :
+    - vent, rafales, direction : premier modèle de « wind_first » (AROME) qui couvre l’heure,
+      sinon le modèle principal (WG) ;
+    - vagues, température, nuages, pluie : modèle principal (WG).
+    Les heures du tableau sont celles du modèle principal, comme sur Windguru."""
+    main = [m for m in ROLES["main"] if m in forecasts] or list(forecasts)
+    wind = [m for m in ROLES["wind"] if m in forecasts]
+    ser = {m: to_series(forecasts[m]) for m in forecasts}
+    main_atmo = [m for m in main if "WINDSPD" in forecasts[m] and "HTSGW" not in forecasts[m]] \
+        or [m for m in main if "WINDSPD" in forecasts[m]]
+    main_wave = [m for m in main if "HTSGW" in forecasts[m] or "SWELL1" in forecasts[m]]
+    hours = sorted({t for m in main_atmo for t in ser[m]})
+    merged, used = {}, defaultdict(lambda: [set(), set()])
+    for t in hours:
+        row, wind_src, wave_src = {}, None, None
+        for m in main_atmo:                                   # base WG
+            r = ser[m].get(t)
+            if r and "WINDSPD" in r:
                 row.update({k: v for k, v in r.items() if not k.startswith(WAVE_KEYS)})
-            if wave_src is None and ("HTSGW" in r or "SWELL1" in r):
-                wave_src = m
+                wind_src = m
+                break
+        for m in wind:                                        # vent AROME s’il couvre l’heure
+            r = ser[m].get(t)
+            if r and "WINDSPD" in r:
+                row.update({k: r[k] for k in WIND_KEYS if k in r})
+                wind_src = m
+                break
+        for m in main_wave:                                   # vagues WG (heure la plus proche, ±1h30)
+            near = [u for u in ser[m] if abs((u - t).total_seconds()) <= 5400]
+            r = ser[m][min(near, key=lambda u: abs((u - t).total_seconds()))] if near else None
+            if r and ("HTSGW" in r or "SWELL1" in r):
                 row.update({k: v for k, v in r.items() if k.startswith(WAVE_KEYS)})
+                wave_src = m
+                break
         if row:
             row["_wind_model"], row["_wave_model"] = wind_src, wave_src
             merged[t] = row
-            day = t.date()
             if wind_src is not None:
-                used[day][0].add(wind_src)
+                used[t.date()][0].add(wind_src)
             if wave_src is not None:
-                used[day][1].add(wave_src)
+                used[t.date()][1].add(wave_src)
     if debug:
         for day, (w, v) in sorted(used.items()):
             fw = ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in sorted(w))
             fv = ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in sorted(v))
-            print(f"  {day} : vent/météo = {fw} ; houle = {fv}")
+            print(f"  {day} : vent = {fw} ; vagues = {fv}")
     return merged
 
 
