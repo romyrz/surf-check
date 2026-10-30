@@ -30,6 +30,11 @@ SPOT = {
     "min_period": 8, "ideal_period": 12,
     "height": (0.8, 2.5),             # m
     "max_wind_kn": 22,
+    # Règles éliminatoires (croix directe, quelle que soit la note)
+    "veto_min_waves": 0.6,       # vagues strictement inférieures (m)
+    "veto_min_period": 8,        # période strictement inférieure (s)
+    "veto_max_wind": 20,         # vent strictement supérieur (nœuds)
+    "star_score": 9,             # étoile au-delà de cette note
     "hours": (7, 20),                 # heures affichées (heure locale)
     "tz": "Europe/Paris",
     # Modèles Windguru : par nom (tel qu’affiché dans le journal) ou par numéro id_model.
@@ -434,6 +439,20 @@ def score_hour(r, tide, s=SPOT):
     return round(max(0, min(10, sc)), 1)
 
 
+def veto(r, s=SPOT):
+    """Raison éliminatoire (texte court) ou None. Comparé aux valeurs affichées (arrondies)."""
+    h = r.get("HTSGW", r.get("SWELL1"))
+    p = r.get("PERPW", r.get("SWPER1"))
+    ws = r.get("WINDSPD")
+    if h is not None and round(h, 1) < s["veto_min_waves"]:
+        return f"vagues < {s['veto_min_waves']:g} m".replace(".", ",")
+    if p is not None and round(p) < s["veto_min_period"]:
+        return f"période < {s['veto_min_period']} s"
+    if ws is not None and round(ws) > s["veto_max_wind"]:
+        return f"vent > {s['veto_max_wind']} nds"
+    return None
+
+
 def verdict(sc):
     return "top" if sc >= 8.5 else "go" if sc >= 7 else "ok" if sc >= 5 else "nul"
 
@@ -454,7 +473,9 @@ def build_days(merged, tides, s=SPOT):
         if sc is None:
             continue
         days[lt.date()].append({"t": lt, "r": r, "tide": tide, "sst": sst,
-                                "coef": coef_at(t, coefs), "score": sc, "v": verdict(sc)})
+                                "coef": coef_at(t, coefs), "score": sc, "veto": (vt := veto(r, s)),
+                                "v": "nul" if vt else verdict(sc),
+                                "star": not vt and sc > s["star_score"]})
     tides_by_day = defaultdict(list)
     for t, h, kind in ex:
         lt = t.astimezone(tz)
@@ -511,14 +532,16 @@ document.querySelectorAll('.mbtn').forEach(function (b) {
   });
 });
 </script>"""
+STAR = ('<svg class="star" viewBox="0 0 24 24" aria-label="Exceptionnel"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 '
+        '1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z"/></svg>')
 LABEL = {"top": "Top", "go": "GO", "ok": "Correct", "nul": "Nul"}
 
 CSS = """
-:root{--top:#7b3fd4;--bg:#eef4f6;--card:#ffffff;--ink:#0f2533;--muted:#5d7380;--line:#d3e0e6;
+:root{--star:#e0a100;--top:#7b3fd4;--bg:#eef4f6;--card:#ffffff;--ink:#0f2533;--muted:#5d7380;--line:#d3e0e6;
 --go:#1767d1;--ok:#23955a;--off:#23955a;--on:#c2412d;--side:#b07a12;color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--top:#b48cff;--bg:#0b1820;--card:#112430;
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--star:#ffd24a;--top:#b48cff;--bg:#0b1820;--card:#112430;
 --ink:#e4eef2;--muted:#8fa6b2;--line:#21394a;--go:#5aa2ff;--ok:#46c483;--off:#46c483;--on:#ff7a63;--side:#e2b04a;color-scheme:dark}}
-:root[data-theme="dark"]{--top:#b48cff;--bg:#0b1820;--card:#112430;--ink:#e4eef2;--muted:#8fa6b2;--line:#21394a;
+:root[data-theme="dark"]{--star:#ffd24a;--top:#b48cff;--bg:#0b1820;--card:#112430;--ink:#e4eef2;--muted:#8fa6b2;--line:#21394a;
 --go:#5aa2ff;--ok:#46c483;--off:#46c483;--on:#ff7a63;--side:#e2b04a;color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Barlow",system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -527,7 +550,12 @@ h1{font:600 2.4rem/1 "Barlow Condensed","Arial Narrow",sans-serif;margin:0 0 4px
 .sub{color:var(--muted);margin:0 0 22px}
 .demo{display:inline-block;background:var(--on);color:#fff;padding:2px 8px;border-radius:4px;font-size:.85rem;margin-left:8px}
 .ic{width:34px;height:34px;fill:none;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round}
-.ic.top{stroke:var(--top)}.ic.go{stroke:var(--go)}.ic.ok{stroke:var(--ok)}.ic.nul{stroke:var(--ink)}
+.ic.top{stroke:var(--top)}
+.vi{position:relative;display:inline-block;line-height:0}
+.star{position:absolute;top:-6px;right:-10px;width:16px;height:16px;fill:var(--star);stroke:var(--card);stroke-width:1.5}
+.day .star{width:20px;height:20px;right:-12px}
+.legend .vi .star{position:static;width:18px;height:18px}
+td.veto{font-size:.72rem;white-space:nowrap}.ic.go{stroke:var(--go)}.ic.ok{stroke:var(--ok)}.ic.nul{stroke:var(--ink)}
 .week{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px;margin-bottom:34px}
 .day{display:block;text-decoration:none;color:inherit;background:var(--card);border:1px solid var(--line);
 border-radius:10px;padding:12px 12px 10px}
@@ -657,21 +685,23 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
     summary = {}
     for day, hours in days.items():
         v, win = best_window(hours)
-        summary[day] = (v, win)
+        star = any(h["star"] for h in hours)
+        summary[day] = (v, win, star)
         cs = [c for _, k, c in tides_by_day.get(day, []) if k == "PM" and c]
         ctxt = f'<div class="c">coef {"/".join(map(str, cs))}</div>' if cs else ""
         out.append(f'<a class="day" href="#j{day:%m%d}"><div class="d">{JOURS[day.weekday()][:3]}.</div>'
-                   f'<div class="n">{day.day} {MOIS_C[day.month - 1]}</div>{ICON[v]}'
+                   f'<div class="n">{day.day} {MOIS_C[day.month - 1]}</div><span class="vi">{ICON[v]}{STAR if star else ""}</span>'
                    + (f'<div class="w">{win}</div>' if win else '<div class="w none">rien de bon</div>') + ctxt + "</a>")
     out.append("</div>")
     out.append('<div class="legend">'
                f'<span>{ICON["top"]} Top (8,5/10 et plus)</span>'
                f'<span>{ICON["go"]} GO (7 à 8,5)</span>'
                f'<span>{ICON["ok"]} Correct (5 à 7)</span>'
-               f'<span>{ICON["nul"]} Nul (moins de 5)</span></div>')
+               f'<span>{ICON["nul"]} Nul (moins de 5, ou vagues &lt; 0,6 m, période &lt; 8 s, vent &gt; 20 nds)</span>'
+               f'<span><span class="vi">{STAR}</span> Exceptionnel (plus de 9/10)</span></div>')
 
     for day, hours in days.items():
-        v, win = summary[day]
+        v, win, _ = summary[day]
         tl = tides_by_day.get(day, [])
         meta = []
         if win:
@@ -698,8 +728,10 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
         def row(label, cells, cls=""):
             out.append(f'<tr class="{cls}"><th>{label}</th>' + "".join(cells) + "</tr>")
 
-        row("", [f'<td class="{h["v"]}">{ICON[h["v"]]}</td>' for h in hours], "v")
-        row("Note", [f'<td class="{h["v"]}">{h["score"]:.1f}</td>' for h in hours], "sc")
+        row("", [f'<td class="{h["v"]}"><span class="vi">{ICON[h["v"]]}{STAR if h["star"] else ""}</span></td>'
+                 for h in hours], "v")
+        row("Note", [f'<td class="{h["v"]} veto">{h["veto"]}</td>' if h["veto"]
+                     else f'<td class="{h["v"]}">{h["score"]:.1f}</td>' for h in hours], "sc")
         R = [h["r"] for h in hours]
         row("Vagues (m)", [houle_cell(r.get('HTSGW', r.get('SWELL1'))) for r in R])
         row("Période (s)", [f"<td>{fmt(r.get('PERPW', r.get('SWPER1')))}</td>" for r in R])
@@ -754,8 +786,9 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
 def text_summary(summary, s=SPOT):
     emo = {"top": "💜 Top", "go": "🌊 GO", "ok": "🟢 Correct", "nul": "✖️ Nul"}
     lines = [f"Surf {s['name']}"]
-    for day, (v, win) in summary.items():
-        lines.append(f"{JOURS[day.weekday()][:3]} {day.day} : {emo[v]}" + (f" ({win})" if win else ""))
+    for day, (v, win, star) in summary.items():
+        lines.append(f"{JOURS[day.weekday()][:3]} {day.day} : {emo[v]}" + (" ⭐" if star else "")
+                     + (f" ({win})" if win else ""))
     return "\n".join(lines)
 
 
