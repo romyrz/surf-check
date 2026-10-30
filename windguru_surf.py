@@ -31,6 +31,11 @@ SPOT = {
     "max_wind_kn": 22,
     "hours": (7, 20),                 # heures affichées (heure locale)
     "tz": "Europe/Paris",
+    # True = utiliser uniquement les modèles de l’onglet affiché par défaut sur Windguru
+    # (onglet « WG »), pour voir exactement les mêmes chiffres que sur le site.
+    "default_tab_only": True,
+    # Pour imposer d’autres modèles : leurs numéros id_model (visibles dans le journal), ex. [3, 84].
+    "models": [],
     "marc_zone": "7032_2",            # zone MARC Ifremer Quiberon / Ria d’Etel
     "marc_days": 6,                   # cartes MARC disponibles sur 6 jours
 }
@@ -79,10 +84,52 @@ def find_model_ids(obj, found=None):
     return found
 
 
-def fetch_windguru(spot_id, debug=False):
-    models = find_model_ids(wg_get({"q": "forecast_spot", "id_spot": spot_id}))
+def model_names(obj, names=None):
+    """Associe chaque id_model à son nom quand Windguru le fournit."""
+    names = {} if names is None else names
+    if isinstance(obj, dict):
+        mid = obj.get("id_model")
+        if str(mid).isdigit():
+            for k in ("model_name", "model_longname", "name", "model", "label"):
+                if isinstance(obj.get(k), str) and obj[k].strip():
+                    names.setdefault(int(mid), obj[k].strip())
+                    break
+        for v in obj.values():
+            model_names(v, names)
+    elif isinstance(obj, list):
+        for v in obj:
+            model_names(v, names)
+    return names
+
+
+MODEL_NAMES = {}
+
+
+def fetch_windguru(spot_id, debug=False, s=SPOT):
+    spot = wg_get({"q": "forecast_spot", "id_spot": spot_id})
+    models = find_model_ids(spot)
+    MODEL_NAMES.update(model_names(spot))
+    tabs = spot.get("tabs") if isinstance(spot, dict) else None
+    if debug and isinstance(tabs, list):
+        for i, tab in enumerate(tabs):
+            ids = find_model_ids(tab)
+            print(f"Onglet Windguru {i}{' (par défaut)' if i == 0 else ''} : "
+                  + ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in ids))
+    if s.get("models"):
+        prio = [m for m in s["models"] if m in models]
+        models = prio
+    elif s.get("default_tab_only") and isinstance(tabs, list) and tabs:
+        first = find_model_ids(tabs[0])
+        if first:
+            models = first
+        elif debug:
+            print("Onglet par défaut vide : tous les modèles sont utilisés.")
+    elif debug and not isinstance(tabs, list):
+        print("Structure des onglets non reconnue : tous les modèles sont utilisés.")
     if debug:
-        print(f"Modèles Windguru : {models}")
+        print("Modèles Windguru (ordre de priorité) :")
+        for m in models:
+            print(f"  {m} : {MODEL_NAMES.get(m, '(nom inconnu)')}")
     out = {}
     for m in models:
         try:
@@ -117,7 +164,11 @@ def merge(forecasts, debug=False):
     Pour chaque heure, le vent/la météo viennent du premier modèle qui a du vent à cette heure,
     la houle du premier modèle qui a des vagues à cette heure. Quand un modèle fin (ex. AROME)
     s’arrête après 2 jours, le suivant prend le relais."""
-    series = [(m, to_series(fc)) for m, fc in forecasts.items()]
+    # Un modèle de vagues contient aussi le vent qui le « pousse » (souvent un GFS grossier,
+    # au large) : on ne s’en sert pour le vent qu’en dernier recours.
+    is_wave = {m: ("HTSGW" in fc or "SWELL1" in fc) for m, fc in forecasts.items()}
+    order = sorted(forecasts, key=lambda m: is_wave[m])          # tri stable
+    series = [(m, to_series(forecasts[m])) for m in order]
     merged = {}
     used = defaultdict(lambda: [set(), set()])
     for t in sorted({t for _, ser in series for t in ser}):
@@ -143,7 +194,9 @@ def merge(forecasts, debug=False):
                 used[day][1].add(wave_src)
     if debug:
         for day, (w, v) in sorted(used.items()):
-            print(f"  {day} : vent/météo modèle(s) {sorted(w)}, houle modèle(s) {sorted(v)}")
+            fw = ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in sorted(w))
+            fv = ", ".join(f"{m} {MODEL_NAMES.get(m, '')}".strip() for m in sorted(v))
+            print(f"  {day} : vent/météo = {fw} ; houle = {fv}")
     return merged
 
 
@@ -300,9 +353,9 @@ def wind_kind(wd, s=SPOT):
 
 
 def score_hour(r, tide, s=SPOT):
-    h = r.get("SWELL1", r.get("HTSGW"))
-    p = r.get("SWPER1", r.get("PERPW"))
-    d = r.get("SWDIR1", r.get("DIRPW"))
+    h = r.get("HTSGW", r.get("SWELL1"))
+    p = r.get("PERPW", r.get("SWPER1"))
+    d = r.get("DIRPW", r.get("SWDIR1"))
     ws, wd = r.get("WINDSPD"), r.get("WINDDIR")
     if h is None or p is None or ws is None:
         return None
@@ -603,9 +656,9 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
         row("", [f'<td class="{h["v"]}">{ICON[h["v"]]}</td>' for h in hours], "v")
         row("Note", [f'<td class="{h["v"]}">{h["score"]:.1f}</td>' for h in hours], "sc")
         R = [h["r"] for h in hours]
-        row("Houle (m)", [houle_cell(r.get('SWELL1', r.get('HTSGW'))) for r in R])
-        row("Période (s)", [f"<td>{fmt(r.get('SWPER1', r.get('PERPW')))}</td>" for r in R])
-        row("Dir. houle", [f"<td>{arrow(r.get('SWDIR1', r.get('DIRPW')))} <small>{fmt(r.get('SWDIR1', r.get('DIRPW')))}°</small></td>" for r in R])
+        row("Vagues (m)", [houle_cell(r.get('HTSGW', r.get('SWELL1'))) for r in R])
+        row("Période (s)", [f"<td>{fmt(r.get('PERPW', r.get('SWPER1')))}</td>" for r in R])
+        row("Dir. vagues", [f"<td>{arrow(r.get('DIRPW', r.get('SWDIR1')))} <small>{fmt(r.get('DIRPW', r.get('SWDIR1')))}°</small></td>" for r in R])
         row("Vent (nds)", [wind_cell(r.get("WINDSPD")) for r in R])
         row("Rafales (nds)", [wind_cell(r.get("GUST")) for r in R])
         cells = []
@@ -699,6 +752,36 @@ def make_demo(s=SPOT):
 # =============================================================== MAIN
 
 
+def inspect(forecasts, when, s=SPOT):
+    """Affiche, pour une heure donnée, la valeur brute de chaque modèle Windguru."""
+    tz = ZoneInfo(s["tz"])
+    lt = datetime.strptime(when, "%Y-%m-%d %H").replace(tzinfo=tz)
+    t = lt.astimezone(timezone.utc)
+    merged = merge(forecasts)
+    print(f"\n=== Inspection {lt:%a %d/%m %Hh} (heure de Paris) = {t:%H}h UTC ===")
+    for m, fc in forecasts.items():
+        name = MODEL_NAMES.get(m, "")
+        kind = "vagues" if ("HTSGW" in fc or "SWELL1" in fc) else "météo"
+        init = datetime.fromtimestamp(fc["initstamp"], tz=timezone.utc)
+        ser = to_series(fc)
+        r = ser.get(t)
+        units = {k: v for k, v in fc.items() if "unit" in k.lower()}
+        print(f"- modèle {m} {name} [{kind}], run du {init:%d/%m %Hh} UTC, {len(fc['hours'])} pas"
+              + (f", unités {units}" if units else ""))
+        if r is None:
+            print("    pas de donnée à cette heure")
+            continue
+        i = fc["hours"].index(int(round((t - init).total_seconds() / 3600)))
+        extra = {k: fc[k][i] for k in ("hr_d", "hr_h", "hr_weekday") if isinstance(fc.get(k), list)}
+        vals = {k: r.get(k) for k in ("WINDSPD", "GUST", "WINDDIR", "TMP", "HTSGW", "PERPW", "SWELL1", "SWPER1")
+                if k in r}
+        print(f"    index {i}, heure selon Windguru {extra or '(non fournie)'}")
+        print(f"    valeurs brutes {vals}")
+    row = merged.get(t, {})
+    print(f"→ Rapport : vent {row.get('WINDSPD')} / rafales {row.get('GUST')} pris du modèle "
+          f"{row.get('_wind_model')}, houle du modèle {row.get('_wave_model')}\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spot", type=int, default=SPOT["id"])
@@ -706,6 +789,8 @@ def main():
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--marc", action="store_true", help="photographier les cartes MARC (Ifremer)")
+    ap.add_argument("--inspect", default=os.getenv("INSPECT", ""),
+                    help='détail des modèles pour une heure, ex. "2026-10-31 10"')
     a = ap.parse_args()
     tz = ZoneInfo(SPOT["tz"])
 
@@ -713,13 +798,15 @@ def main():
         forecasts, tides = make_demo()
     else:
         try:
-            forecasts = fetch_windguru(a.spot, a.debug)
+            forecasts = fetch_windguru(a.spot, a.debug or bool(a.inspect))
         except Exception as e:
             sys.exit(f"Impossible de joindre Windguru : {e}")
         if not forecasts:
             sys.exit("Aucune prévision Windguru reçue (relance avec --debug).")
         tides = get_tides(SPOT, tz, a.debug)
 
+    if a.inspect:
+        inspect(forecasts, a.inspect)
     days, tides_by_day = build_days(merge(forecasts, a.debug), tides)
     marc = {}
     if a.marc:
