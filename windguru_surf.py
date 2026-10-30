@@ -484,7 +484,7 @@ CSS = """
 --go:#5aa2ff;--ok:#46c483;--off:#46c483;--on:#ff7a63;--side:#e2b04a;color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Barlow",system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:1100px;margin:0 auto;padding:28px 18px 60px}
+main{max-width:1500px;margin:0 auto;padding:28px 18px 60px}
 h1{font:600 2.4rem/1 "Barlow Condensed","Arial Narrow",sans-serif;margin:0 0 4px;letter-spacing:-.01em}
 .sub{color:var(--muted);margin:0 0 22px}
 .demo{display:inline-block;background:var(--on);color:#fff;padding:2px 8px;border-radius:4px;font-size:.85rem;margin-left:8px}
@@ -520,7 +520,12 @@ td.ok{background:color-mix(in srgb,var(--ok) 12%,transparent)}
 .marc{color:var(--go);display:inline-flex;padding:4px;border-radius:6px;border:0;background:none;cursor:pointer;font:inherit}
 .marc:hover,.marc:focus-visible{background:color-mix(in srgb,var(--go) 15%,transparent);outline:none}
 .marc[aria-pressed="true"]{background:var(--go);color:var(--card)}
-.marcview{margin:12px 0 0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;max-width:770px}
+.daygrid{display:grid;grid-template-columns:minmax(300px,520px) minmax(0,1fr);gap:14px;align-items:start}
+.daygrid .scroll{min-width:0}
+@media (max-width:900px){.daygrid{grid-template-columns:minmax(0,1fr)}}
+.marcview{margin:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;
+position:sticky;top:calc(env(safe-area-inset-top,0px) + 10px)}
+@media (max-width:900px){.marcview{position:static}}
 .marcview img{display:block;width:100%;height:auto;border-radius:4px;background:#fff}
 .marcview figcaption{color:var(--muted);font-size:.9rem;margin-top:8px}
 .marcview figcaption a{color:var(--go)}
@@ -646,7 +651,9 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
         out.append(f'<section id="j{day:%m%d}"><h2>{ICON[v]}{JOURS[day.weekday()].capitalize()} {day.day} {MOIS[day.month - 1]}</h2>'
                    f'<p class="meta">{", ".join(meta) if meta else "Pas de créneau correct"}</p>'
                    + (f'<p class="meta tides">{tide_line}</p>' if tide_line else "")
-                   + '<div class="scroll"><table><thead><tr><th></th>')
+                   )
+        grid_at = len(out)                    # la carte sera insérée ici, à gauche du tableau
+        out.append('<div class="scroll"><table><thead><tr><th></th>')
         out += [f'<td>{h["t"]:%H}h</td>' for h in hours]
         out.append("</tr></thead><tbody>")
 
@@ -690,13 +697,14 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
                 viewer = (f'<figure class="marcview" id="{vid}"><img src="{marc_dir}/{marc[first["t"]]}" '
                           f'alt="Carte MARC des vagues" loading="lazy" width="748" height="576">'
                           f'<figcaption>Hauteur et direction des vagues à <span class="mh">{first["t"]:%H}h</span>. '
-                          f'Clique sur une icône de carte du tableau pour changer d’heure. '
+                          f'Clique sur une icône de carte dans le tableau pour changer d’heure. '
                           f'<a href="{e(marc_link(first["t"], s))}" target="_blank" rel="noopener">Ouvrir sur MARC</a>'
                           f'</figcaption></figure>')
         row("Coef", [f"<td>{h['coef'] if h['coef'] else '–'}</td>" for h in hours])
         row("Air (°C)", [f"<td>{fmt(r.get('TMP'))}</td>" for r in R])
         row("Nuages (%)", [f"<td>{fmt(r.get('TCDC'))}</td>" for r in R])
-        out.append("</tbody></table></div>" + viewer + "</section>")
+        out.append("</tbody></table></div></div></section>")
+        out.insert(grid_at, ('<div class="daygrid">' + viewer) if viewer else '<div class="dayonly">')
 
     out.append("<footer>Vent, houle et météo : Windguru. Marées, coefficients (calculés depuis Brest) "
                "et température de l’eau : Open-Meteo, modèles DWD, valeurs indicatives. "
