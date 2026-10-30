@@ -112,19 +112,40 @@ def to_series(fc):
 WAVE_KEYS = ("HTSGW", "PERPW", "DIRPW", "SWELL", "SWPER", "SWDIR", "WV")
 
 
-def merge(forecasts):
-    """Vent/météo du premier modèle atmosphérique, houle du premier modèle de vagues."""
-    merged = defaultdict(dict)
-    wind_done = wave_done = False
-    for fc in forecasts.values():
-        for t, row in to_series(fc).items():
-            for k, v in row.items():
-                wave = k.startswith(WAVE_KEYS)
-                if (wave and not wave_done) or (not wave and not wind_done):
-                    merged[t].setdefault(k, v)
-        wind_done |= "WINDSPD" in fc
-        wave_done |= "HTSGW" in fc or "SWELL1" in fc
-    return dict(sorted(merged.items()))
+def merge(forecasts, debug=False):
+    """Fusionne les modèles heure par heure, dans l’ordre de Windguru (le plus précis d’abord).
+    Pour chaque heure, le vent/la météo viennent du premier modèle qui a du vent à cette heure,
+    la houle du premier modèle qui a des vagues à cette heure. Quand un modèle fin (ex. AROME)
+    s’arrête après 2 jours, le suivant prend le relais."""
+    series = [(m, to_series(fc)) for m, fc in forecasts.items()]
+    merged = {}
+    used = defaultdict(lambda: [set(), set()])
+    for t in sorted({t for _, ser in series for t in ser}):
+        row = {}
+        wind_src = wave_src = None
+        for m, ser in series:
+            r = ser.get(t)
+            if not r:
+                continue
+            if wind_src is None and "WINDSPD" in r:
+                wind_src = m
+                row.update({k: v for k, v in r.items() if not k.startswith(WAVE_KEYS)})
+            if wave_src is None and ("HTSGW" in r or "SWELL1" in r):
+                wave_src = m
+                row.update({k: v for k, v in r.items() if k.startswith(WAVE_KEYS)})
+        if row:
+            row["_wind_model"], row["_wave_model"] = wind_src, wave_src
+            merged[t] = row
+            day = t.date()
+            if wind_src is not None:
+                used[day][0].add(wind_src)
+            if wave_src is not None:
+                used[day][1].add(wave_src)
+    if debug:
+        for day, (w, v) in sorted(used.items()):
+            print(f"  {day} : vent/météo modèle(s) {sorted(w)}, houle modèle(s) {sorted(v)}")
+    return merged
+
 
 # =============================================================== CARTES MARC (IFREMER)
 
@@ -699,7 +720,7 @@ def main():
             sys.exit("Aucune prévision Windguru reçue (relance avec --debug).")
         tides = get_tides(SPOT, tz, a.debug)
 
-    days, tides_by_day = build_days(merge(forecasts), tides)
+    days, tides_by_day = build_days(merge(forecasts, a.debug), tides)
     marc = {}
     if a.marc:
         today = datetime.now(tz).date()
