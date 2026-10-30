@@ -38,9 +38,9 @@ SPOT = {
     "hours": (7, 20),                 # heures affichées (heure locale)
     "tz": "Europe/Paris",
     # Modèles Windguru : par nom (tel qu’affiché dans le journal) ou par numéro id_model.
-    "main_model": "WG",          # source de base : vagues, température, nuages, et vent après AROME
-    "wind_first": ["AROME"],     # vent prioritaire tant qu’il couvre l’heure (environ 2 jours)
-    "exclude": ["GFS 13"],       # jamais utilisés
+    "main_model": 100,           # WG, le tableau affiché par défaut sur Windguru
+    "wind_first": [52],          # AROME-FR 1.3 pour le vent tant qu’il couvre l’heure ([] = vent WG partout)
+    "exclude": [3],              # GFS 13, jamais utilisé
     "marc_zone": "7032_2",            # zone MARC Ifremer Quiberon / Ria d’Etel
     "marc_days": 6,                   # cartes MARC disponibles sur 6 jours
 }
@@ -55,6 +55,7 @@ BREST = (48.30, -4.80)                # référence officielle des coefficients
 U_BREST = 6.10                        # marnage (m) correspondant au coef 100
 
 WG_API = "https://www.windguru.cz/int/iapi.php"
+WG_PAGE = "https://www.windguru.cz/{spot}"
 MARINE_API = "https://marine-api.open-meteo.com/v1/marine"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -89,13 +90,22 @@ def find_model_ids(obj, found=None):
     return found
 
 
+NAME_KEYS = ("model_name", "model_longname", "name", "model", "label", "title", "nm")
+
+
 def model_names(obj, names=None):
     """Associe chaque id_model à son nom quand Windguru le fournit."""
     names = {} if names is None else names
     if isinstance(obj, dict):
+        for k, v in obj.items():                     # forme {"3": {"model_name": ...}}
+            if str(k).isdigit() and isinstance(v, dict):
+                for nk in NAME_KEYS:
+                    if isinstance(v.get(nk), str) and v[nk].strip():
+                        names.setdefault(int(k), v[nk].strip())
+                        break
         mid = obj.get("id_model")
         if str(mid).isdigit():
-            for k in ("model_name", "model_longname", "name", "model", "label"):
+            for k in NAME_KEYS:
                 if isinstance(obj.get(k), str) and obj[k].strip():
                     names.setdefault(int(mid), obj[k].strip())
                     break
@@ -107,7 +117,33 @@ def model_names(obj, names=None):
     return names
 
 
-MODEL_NAMES = {}
+MODEL_NAMES = {100: "WG", 3: "GFS 13", 84: "GFS-Wave 16", 117: "IFS-HRES 9", 118: "IFS-WAM 9",
+               52: "AROME-FR 1.3", 109: "HARM-DK 2", 101: "UKV 2", 64: "Zephr-HD 2.6", 21: "WRF 9",
+               57: "HARMONIE 5", 43: "ICON 7", 46: "EWAM 5", 45: "ICON 13", 59: "GDPS 15",
+               60: "GDWPS 25"}
+
+
+def model_info(obj, info=None):
+    """Champs simples associés à chaque id_model dans la réponse forecast_spot."""
+    info = {} if info is None else info
+    if isinstance(obj, dict):
+        mid = obj.get("id_model")
+        if str(mid).isdigit():
+            d = info.setdefault(int(mid), {})
+            for k, v in obj.items():
+                if isinstance(v, (str, int, float)) and k != "id_model":
+                    d.setdefault(k, v)
+        for k, v in obj.items():
+            if str(k).isdigit() and isinstance(v, dict):
+                d = info.setdefault(int(k), {})
+                for kk, vv in v.items():
+                    if isinstance(vv, (str, int, float)):
+                        d.setdefault(kk, vv)
+            model_info(v, info)
+    elif isinstance(obj, list):
+        for v in obj:
+            model_info(v, info)
+    return info
 
 
 def model_matches(m, key):
@@ -125,11 +161,19 @@ def fetch_windguru(spot_id, debug=False, s=SPOT):
     spot = wg_get({"q": "forecast_spot", "id_spot": spot_id})
     models = find_model_ids(spot)
     MODEL_NAMES.update(model_names(spot))
+    info = model_info(spot)
     tabs = spot.get("tabs") if isinstance(spot, dict) else None
     if debug:
+        os.makedirs("site", exist_ok=True)
+        with open("site/windguru_spot.json", "w", encoding="utf-8") as f:
+            json.dump(spot, f, ensure_ascii=False, indent=1)
+        print(f"Clés de la réponse Windguru : {list(spot) if isinstance(spot, dict) else type(spot)}")
+        if isinstance(tabs, list):
+            for i, tab in enumerate(tabs[:3]):
+                print(f"  onglet {i} (extrait) : {json.dumps(tab, ensure_ascii=False)[:600]}")
         print("Modèles Windguru disponibles :")
         for m in models:
-            print(f"  {m} : {MODEL_NAMES.get(m, '(nom inconnu)')}")
+            print(f"  {m} : {MODEL_NAMES.get(m, '(nom inconnu)')}  {json.dumps(info.get(m, {}), ensure_ascii=False)[:300]}")
         if isinstance(tabs, list):
             for i, tab in enumerate(tabs):
                 print(f"  onglet {i} : {find_model_ids(tab)}")
@@ -165,7 +209,16 @@ def fetch_windguru(spot_id, debug=False, s=SPOT):
     out = {}
     for m in dict.fromkeys(wind + main):
         try:
-            d = wg_get({"q": "forecast", "id_model": m, "id_spot": spot_id})
+            params = {"q": "forecast", "id_model": m, "id_spot": spot_id}
+            for k in ("rundef", "initstr", "id_model_arr", "cachefix"):
+                if k in info.get(m, {}):
+                    params[k] = info[m][k]
+            try:
+                d = wg_get(params)
+            except requests.HTTPError:
+                if len(params) == 3:
+                    raise
+                d = wg_get({"q": "forecast", "id_model": m, "id_spot": spot_id})
             fc = d.get("fcst", d)
             if "hours" in fc:
                 out[m] = fc
@@ -174,7 +227,55 @@ def fetch_windguru(spot_id, debug=False, s=SPOT):
                           f"{[k for k, v in fc.items() if isinstance(v, list)]}")
         except Exception as e:
             print(f"  {m}: échec ({e})")
+            if m in main[:1]:                             # WG : on passe par la page
+                fc = fetch_via_browser(spot_id, m, debug)
+                if fc and "hours" in fc:
+                    out[m] = fc
+                    print(f"  {m}: {len(fc['hours'])} pas (via la page), "
+                          f"{[k for k, v in fc.items() if isinstance(v, list)]}")
     return out
+
+
+def fetch_via_browser(spot_id, model, debug=False):
+    """Ouvre la page Windguru du spot comme un visiteur et récupère la prévision du modèle
+    demandé au moment où la page la charge (c’est ainsi que le tableau WG arrive à l’écran)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("Playwright absent : impossible de lire WG via la page.")
+        return None
+    got = {}
+
+    def on_response(resp):
+        u = resp.url
+        if ("iapi.php" in u and re.search(r"[?&]q=forecast(&|$)", u)
+                and re.search(rf"[?&]id_model={model}(&|$)", u) and "data" not in got):
+            try:
+                got["data"], got["url"] = resp.json(), u
+            except Exception:
+                pass
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(locale="fr-FR", user_agent=HEADERS["User-Agent"],
+                                viewport={"width": 1400, "height": 1000})
+        page.on("response", on_response)
+        try:
+            page.goto(WG_PAGE.format(spot=spot_id), wait_until="domcontentloaded", timeout=60000)
+            for _ in range(80):
+                if "data" in got:
+                    break
+                page.wait_for_timeout(500)
+        except Exception as e:
+            print(f"  page Windguru : échec ({str(e).splitlines()[0][:120]})")
+        browser.close()
+    if "data" not in got:
+        print(f"  modèle {model} introuvable dans les échanges de la page Windguru")
+        return None
+    if debug:
+        print(f"  modèle {model} lu via la page : {got['url']}")
+    d = got["data"]
+    return d.get("fcst", d) if isinstance(d, dict) else None
 
 
 def to_series(fc):
@@ -202,10 +303,13 @@ def merge(forecasts, debug=False):
     main = [m for m in ROLES["main"] if m in forecasts] or list(forecasts)
     wind = [m for m in ROLES["wind"] if m in forecasts]
     ser = {m: to_series(forecasts[m]) for m in forecasts}
-    main_atmo = [m for m in main if "WINDSPD" in forecasts[m] and "HTSGW" not in forecasts[m]] \
-        or [m for m in main if "WINDSPD" in forecasts[m]]
+    main_atmo = [m for m in main if "WINDSPD" in forecasts[m]]
     main_wave = [m for m in main if "HTSGW" in forecasts[m] or "SWELL1" in forecasts[m]]
-    hours = sorted({t for m in main_atmo for t in ser[m]})
+    if not main_atmo:
+        return {}
+    hours = sorted(ser[main_atmo[0]])                         # colonnes = celles de WG
+    if len(main_atmo) > 1 and hours:                          # au-delà de WG : relais
+        hours += sorted(t for m in main_atmo[1:2] for t in ser[m] if t > hours[-1])
     merged, used = {}, defaultdict(lambda: [set(), set()])
     for t in hours:
         row, wind_src, wave_src = {}, None, None
