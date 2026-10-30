@@ -453,8 +453,62 @@ td.ok{background:color-mix(in srgb,var(--ok) 12%,transparent)}
 .ar{display:inline-block;font-size:1rem;line-height:1}
 .off{color:var(--off)}.on{color:var(--on)}.side-shore{color:var(--side)}
 small{color:var(--muted)}
+td.hs,td.ws{font-weight:600}
 footer{color:var(--muted);font-size:.85rem;margin-top:40px}
 """
+
+
+# Échelle de couleurs des cartes MARC (Ifremer) : (hauteur minimale en m, couleur)
+HOULE_SCALE = [
+    (0.0, "#efe5d8"), (0.1, "#ddcbb5"), (0.25, "#c4ac90"), (0.5, "#c7baf6"),
+    (0.75, "#8f78e8"), (1.0, "#4c30b4"), (1.25, "#7ff2f4"), (1.5, "#3fc4f2"),
+    (1.75, "#1f8fe6"), (2.0, "#1450d0"), (2.25, "#0b2aa3"), (2.5, "#0a7a33"),
+    (2.75, "#15a043"), (3.0, "#2fc45a"), (3.25, "#6fdd66"), (3.5, "#a8ec6b"),
+    (3.75, "#dcf56d"), (4.0, "#ffff66"), (4.5, "#ffe04a"), (5.0, "#ffbf1f"),
+    (5.5, "#ff9500"), (6.0, "#ffc9c9"), (7.0, "#ff9a9a"), (8.0, "#ff3d3d"),
+    (9.0, "#e00000"), (10.0, "#9c5a2e"), (11.0, "#b0002b"), (12.0, "#86002f"),
+    (13.0, "#c2007c"), (14.0, "#ff00c8"), (15.0, "#8e0088"),
+]
+
+
+def houle_cell(h):
+    """Cellule colorée comme sur MARC, texte clair ou foncé selon le fond."""
+    if h is None:
+        return "<td>–</td>"
+    h = round(h, 1)                 # la couleur correspond à la valeur affichée
+    color = HOULE_SCALE[0][1]
+    for lo, c in HOULE_SCALE:
+        if h >= lo:
+            color = c
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    ink = "#10202b" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "#ffffff"
+    return f'<td class="hs" style="background:{color};color:{ink}">{h:.1f}</td>'
+
+
+# Dégradé de couleurs du vent façon Windguru : (nœuds, couleur), interpolé entre les points
+WIND_SCALE = [
+    (0, "#ffffff"), (5, "#ffffff"), (8.5, "#67f7f1"), (13.5, "#00ff00"),
+    (18.5, "#f0ff00"), (24.5, "#ff3200"), (31, "#dc00dc"), (38.5, "#9600ff"),
+    (50, "#4b0082"),
+]
+
+
+def _ink(r, g, b):
+    return "#10202b" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "#ffffff"
+
+
+def wind_cell(kn):
+    if kn is None:
+        return "<td>–</td>"
+    kn = round(kn)
+    pts = [(v, tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))) for v, c in WIND_SCALE]
+    rgb = pts[-1][1]
+    for (v0, c0), (v1, c1) in zip(pts, pts[1:]):
+        if kn <= v1:
+            t = 0 if v1 == v0 else max(0, (kn - v0) / (v1 - v0))
+            rgb = tuple(round(a + (b - a) * t) for a, b in zip(c0, c1))
+            break
+    return (f'<td class="ws" style="background:rgb{rgb};color:{_ink(*rgb)}">{kn}</td>')
 
 
 def arrow(deg):
@@ -528,10 +582,11 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
         row("", [f'<td class="{h["v"]}">{ICON[h["v"]]}</td>' for h in hours], "v")
         row("Note", [f'<td class="{h["v"]}">{h["score"]:.1f}</td>' for h in hours], "sc")
         R = [h["r"] for h in hours]
-        row("Houle (m)", [f"<td>{fmt(r.get('SWELL1', r.get('HTSGW')), '{:.1f}')}</td>" for r in R])
+        row("Houle (m)", [houle_cell(r.get('SWELL1', r.get('HTSGW'))) for r in R])
         row("Période (s)", [f"<td>{fmt(r.get('SWPER1', r.get('PERPW')))}</td>" for r in R])
         row("Dir. houle", [f"<td>{arrow(r.get('SWDIR1', r.get('DIRPW')))} <small>{fmt(r.get('SWDIR1', r.get('DIRPW')))}°</small></td>" for r in R])
-        row("Vent (nds)", [f"<td>{fmt(r.get('WINDSPD'))} <small>{fmt(r.get('GUST'))}</small></td>" for r in R])
+        row("Vent (nds)", [wind_cell(r.get("WINDSPD")) for r in R])
+        row("Rafales (nds)", [wind_cell(r.get("GUST")) for r in R])
         cells = []
         for r in R:
             wd = r.get("WINDDIR")
