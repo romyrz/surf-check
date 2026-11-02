@@ -42,7 +42,8 @@ SPOT = {
     "wind_first": [52],          # AROME-FR 1.3 pour le vent tant qu’il couvre l’heure ([] = vent WG partout)
     "exclude": [3],              # GFS 13, jamais utilisé
     "marc_zone": "7032_2",            # zone MARC Ifremer Quiberon / Ria d’Etel
-    "marc_days": 6,                   # cartes MARC disponibles sur 6 jours
+    "marc_days": 6,
+    "meteo_lat": 47.598, "meteo_lon": -3.118,   # bourg de Plouharnel (prévisions Météo-France)                   # cartes MARC disponibles sur 6 jours
 }
 MARC_URL = ("https://marc.ifremer.fr/resultats/vagues/modeles_atlantique_nord/(variable)/hs/"
             "(typevisu)/map/(zoneid)/{zone}/(date)/{date}/(type)/canvas#appTop")
@@ -466,6 +467,97 @@ def capture_marc(slots, out_dir, s=SPOT, debug=False):
     print(f"Cartes MARC : {len(done)}/{len(slots)} récupérées")
     return done
 
+# =============================================================== MÉTÉO (MÉTÉO-FRANCE)
+
+
+def _weather_of(item):
+    """Trouve le bloc {icon, desc} d’une prévision Météo-France."""
+    for k in ("weather", "weather12H"):
+        v = item.get(k)
+        if isinstance(v, dict) and (v.get("desc") or v.get("icon")):
+            return v
+    for v in item.values():
+        if isinstance(v, dict) and (v.get("desc") or v.get("icon")):
+            return v
+    return None
+
+
+def fetch_meteo(s=SPOT, debug=False):
+    """Prévisions de l’appli Météo-France pour Plouharnel : horaires puis quotidiennes."""
+    try:
+        from meteofrance_api import MeteoFranceClient
+        fc = MeteoFranceClient().get_forecast(s["meteo_lat"], s["meteo_lon"], language="fr")
+    except Exception as e:
+        print(f"Météo-France : échec ({str(e).splitlines()[0][:120]})")
+        return {}
+    tz = ZoneInfo(s["tz"])
+    hourly, daily = {}, {}
+    for it in fc.forecast or []:
+        w = _weather_of(it)
+        if it.get("dt") and w:
+            hourly[datetime.fromtimestamp(it["dt"], tz=timezone.utc)] = w
+    for it in fc.daily_forecast or []:
+        w = it.get("weather12H") if isinstance(it.get("weather12H"), dict) else _weather_of(it)
+        if it.get("dt") and w:
+            daily[datetime.fromtimestamp(it["dt"], tz=timezone.utc).astimezone(tz).date()] = w
+    if hourly:
+        ts = sorted(hourly)
+        steps = defaultdict(int)
+        for a_, b_ in zip(ts, ts[1:]):
+            steps[int((b_ - a_).total_seconds() // 3600)] += 1
+        last_1h = max((b_ for a_, b_ in zip(ts, ts[1:]) if (b_ - a_).total_seconds() <= 3600), default=ts[0])
+        print(f"Météo-France : {len(hourly)} prévisions horaires jusqu’au "
+              f"{ts[-1].astimezone(tz):%d/%m %Hh} (heure par heure jusqu’au {last_1h.astimezone(tz):%d/%m %Hh}, "
+              f"pas : {dict(steps)}), {len(daily)} jours en quotidien")
+    else:
+        print("Météo-France : aucune prévision horaire reçue")
+    return {"hourly": hourly, "daily": daily}
+
+
+def meteo_for(t, meteo, s=SPOT):
+    """Icône pour l’heure t : précise si Météo-France a une prévision horaire à cette heure,
+    sinon tendance (prévision horaire plus espacée ou icône du jour), affichée en grisé."""
+    if not meteo:
+        return None
+    hourly = meteo.get("hourly", {})
+    if hourly:
+        ts = sorted(hourly)
+        near = min(ts, key=lambda u: abs((u - t).total_seconds()))
+        gap = abs((near - t).total_seconds())
+        i = ts.index(near)
+        step = min([abs((ts[j] - near).total_seconds()) for j in (i - 1, i + 1) if 0 <= j < len(ts)] or [99999])
+        if gap <= 1800 and step <= 3600:
+            return {"w": hourly[near], "fuzzy": False}
+        if gap <= 5400:
+            return {"w": hourly[near], "fuzzy": True}
+    w = meteo.get("daily", {}).get(t.astimezone(ZoneInfo(s["tz"])).date())
+    return {"w": w, "fuzzy": True} if w else None
+
+
+def wx_kind(w):
+    """Type de temps à partir de la description Météo-France (et de l’icône pour la nuit)."""
+    d = (w.get("desc") or "").lower()
+    night = str(w.get("icon", "")).endswith("n")
+    if "orage" in d:
+        k = "storm"
+    elif "neige" in d or "flocon" in d:
+        k = "snow"
+    elif "averse" in d:
+        k = "showers"
+    elif "pluie" in d or "bruine" in d or "grêle" in d:
+        k = "rain"
+    elif "brouillard" in d or "brume" in d:
+        k = "fog"
+    elif "très nuageux" in d or "couvert" in d:
+        k = "cloudy"
+    elif "nuageux" in d or "éclaircie" in d or "voilé" in d or "nuage" in d:
+        k = "partly"
+    elif "ensoleillé" in d or "clair" in d or "soleil" in d or "beau" in d:
+        k = "clear"
+    else:
+        k = "partly"
+    return k, night
+
 # =============================================================== WEBCAM BARRE D’ETEL
 
 WEBCAM_PAGE = "https://www.mairie-etel.fr/webcam-la-barre-detel-live"
@@ -704,7 +796,7 @@ def verdict(sc):
 # =============================================================== ASSEMBLAGE
 
 
-def build_days(merged, tides, s=SPOT):
+def build_days(merged, tides, s=SPOT, meteo=None):
     tz = ZoneInfo(s["tz"])
     local, ex, coefs = tides
     days = defaultdict(list)
@@ -720,7 +812,8 @@ def build_days(merged, tides, s=SPOT):
         days[lt.date()].append({"t": lt, "r": r, "tide": tide, "sst": sst,
                                 "coef": coef_at(t, coefs), "score": sc, "veto": (vt := veto(r, s)),
                                 "v": "nul" if vt else verdict(sc),
-                                "star": not vt and sc > s["star_score"]})
+                                "star": not vt and sc > s["star_score"],
+                                "wx": meteo_for(t, meteo, s)})
     tides_by_day = defaultdict(list)
     for t, h, kind in ex:
         lt = t.astimezone(tz)
@@ -811,14 +904,47 @@ SHORT_LABELS = {
     "Nuages (%)": two("Nuages (%)", "Nuag."),
 }
 TIDE_SHORT = {"pleine mer": "haute", "basse mer": "basse", "mi-marée": "mimar"}
+_SUN = ('<g class="s"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2'
+        'M5.4 5.4 7 7M17 17l1.6 1.6M5.4 18.6 7 17M17 7l1.6-1.6"/></g>')
+_MOON = '<path class="m" d="M18.5 14.6A7.2 7.2 0 1 1 9.4 5.5a5.7 5.7 0 0 0 9.1 9.1z"/>'
+_CLOUD = '<path class="c" d="M7.5 19h9a4 4 0 0 0 .4-7.98 5.5 5.5 0 0 0-10.7 1.3A3.4 3.4 0 0 0 7.5 19z"/>'
+
+
+def _wx_svg(kind, night):
+    small = f'<g transform="translate(-2 -2.5) scale(.74)">{_MOON if night else _SUN}</g>'
+    up = lambda inner: f'<g transform="translate(0 -3)">{inner}</g>'
+    body = {
+        "clear": _MOON if night else _SUN,
+        "partly": small + f'<g transform="translate(2 1.8) scale(.9)">{_CLOUD}</g>',
+        "cloudy": _CLOUD,
+        "fog": '<path class="c" d="M4 8h16M3 12h18M5 16h14M7 20h10"/>',
+        "rain": up(_CLOUD) + '<path class="r" d="M9 19.5 8 22.5M13 19.5l-1 3M17 19.5l-1 3"/>',
+        "showers": up(small + f'<g transform="translate(2 1.8) scale(.9)">{_CLOUD}</g>')
+                   + '<path class="r" d="M11 19.5l-1 3M15 19.5l-1 3"/>',
+        "storm": up(_CLOUD) + '<path class="b" d="M13 16.5 10.5 20.5h3L11.5 23.5"/>',
+        "snow": up(_CLOUD) + '<path class="r sn" d="M8.5 21h.01M12 22.5h.01M15.5 21h.01"/>',
+    }[kind]
+    return f'<svg class="wxi" viewBox="0 0 24 24" aria-hidden="true">{body}</svg>'
+
+
+def wx_cell(m):
+    if not m or not m.get("w"):
+        return "<td>–</td>"
+    kind, night = wx_kind(m["w"])
+    desc = html.escape(m["w"].get("desc") or "")
+    tip = desc + (" (tendance)" if m["fuzzy"] else "")
+    return (f'<td class="wx{" fz" if m["fuzzy"] else ""}" title="{tip}">'
+            f'{_wx_svg(kind, night)}<span class="sr">{tip}</span></td>')
+
+
 LABEL = {"top": "Top", "go": "GO", "ok": "Correct", "nul": "Nul"}
 
 CSS = """
-:root{--star:#e0a100;--top:#7b3fd4;--bg:#eef4f6;--card:#ffffff;--ink:#0f2533;--muted:#5d7380;--line:#d3e0e6;
+:root{--cloud:#7d8f9b;--moon:#6b7fb3;--rain:#2f7fd8;--star:#e0a100;--top:#7b3fd4;--bg:#eef4f6;--card:#ffffff;--ink:#0f2533;--muted:#5d7380;--line:#d3e0e6;
 --go:#1767d1;--ok:#23955a;--off:#23955a;--on:#c2412d;--side:#b07a12;color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--star:#ffd24a;--top:#b48cff;--bg:#0b1820;--card:#112430;
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--cloud:#a9b9c4;--moon:#b8c6ee;--rain:#5aa2ff;--star:#ffd24a;--top:#b48cff;--bg:#0b1820;--card:#112430;
 --ink:#e4eef2;--muted:#8fa6b2;--line:#21394a;--go:#5aa2ff;--ok:#46c483;--off:#46c483;--on:#ff7a63;--side:#e2b04a;color-scheme:dark}}
-:root[data-theme="dark"]{--star:#ffd24a;--top:#b48cff;--bg:#0b1820;--card:#112430;--ink:#e4eef2;--muted:#8fa6b2;--line:#21394a;
+:root[data-theme="dark"]{--cloud:#a9b9c4;--moon:#b8c6ee;--rain:#5aa2ff;--star:#ffd24a;--top:#b48cff;--bg:#0b1820;--card:#112430;--ink:#e4eef2;--muted:#8fa6b2;--line:#21394a;
 --go:#5aa2ff;--ok:#46c483;--off:#46c483;--on:#ff7a63;--side:#e2b04a;color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 "Barlow",system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -886,6 +1012,13 @@ border:1px solid var(--line)}
 .off{color:var(--off)}.on{color:var(--on)}.side-shore{color:var(--side)}
 small{color:var(--muted)}
 td.hs,td.ws{font-weight:600}
+.wxi{width:28px;height:28px;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;vertical-align:middle}
+.wxi .s{stroke:var(--star)}.wxi .s circle{fill:color-mix(in srgb,var(--star) 22%,var(--card))}
+.wxi .c{stroke:var(--cloud);fill:var(--card)}.wxi .m{stroke:var(--moon);fill:color-mix(in srgb,var(--moon) 15%,var(--card))}
+.wxi .r{stroke:var(--rain)}.wxi .sn{stroke-width:2.6}.wxi .b{stroke:var(--star);stroke-width:2}
+td.wx.fz .wxi{opacity:.38;filter:grayscale(.6)}
+.legend .wxi{width:22px;height:22px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .sm{display:none}
 @media (max-width:700px){
   .lg{display:none}.sm{display:inline}
@@ -1003,7 +1136,8 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
                f'<span>{ICON["go"]} GO (7 à 8,5)</span>'
                f'<span>{ICON["ok"]} Correct (5 à 7)</span>'
                f'<span>{ICON["nul"]} Nul (moins de 5, ou vagues &lt; 0,6 m, période &lt; 8 s, vent &gt; 20 nds)</span>'
-               f'<span><span class="vi">{STAR}</span> Exceptionnel (plus de 9/10)</span></div>')
+               f'<span><span class="vi">{STAR}</span> Exceptionnel (plus de 9/10)</span>'
+               f'<span>{_wx_svg("partly", False)} Météo-France (grisée = tendance)</span></div>')
 
     cam = webcam or {}
     out.append('<section class="webcam" id="webcam"><h2>Webcam live barre d’Etel</h2>')
@@ -1099,6 +1233,7 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
                           f'<a href="{e(marc_link(first["t"], s))}" target="_blank" rel="noopener">Ouvrir sur MARC</a>'
                           f'</figcaption></figure>')
         row("Coef", [f"<td>{h['coef'] if h['coef'] else '–'}</td>" for h in hours])
+        row("Météo", [wx_cell(h["wx"]) for h in hours], "wxr")
         row("Air (°C)", [f"<td>{fmt(r.get('TMP'))}</td>" for r in R])
         row("Nuages (%)", [f"<td>{fmt(clouds(r))}</td>" for r in R])
         out.append("</tbody></table></div></div></section>")
@@ -1156,6 +1291,19 @@ def make_demo(s=SPOT):
     coefs = coefficients(times, [lvl(i, 2.6) for i in idx])
     return {0: fc}, (local, ex, coefs)
 
+def demo_meteo(s=SPOT):
+    """Prévisions fictives : horaires sur 48 h puis une icône par jour."""
+    descs = ["Ensoleillé", "Éclaircies", "Très nuageux", "Averses", "Pluie", "Brume", "Risque d’orages",
+             "Peu nuageux", "Ciel clair"]
+    start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    hourly = {start + timedelta(hours=i): {"desc": descs[(i // 3) % len(descs)],
+                                           "icon": "p1n" if (start + timedelta(hours=i)).hour in (20, 21, 22) else "p1j"}
+              for i in range(48)}
+    tz = ZoneInfo(s["tz"])
+    daily = {(start + timedelta(days=d)).astimezone(tz).date(): {"desc": descs[d % len(descs)], "icon": "p1j"}
+             for d in range(15)}
+    return {"hourly": hourly, "daily": daily}
+
 # =============================================================== MAIN
 
 
@@ -1202,8 +1350,10 @@ def main():
     a = ap.parse_args()
     tz = ZoneInfo(SPOT["tz"])
 
+    meteo = {}
     if a.demo:
         forecasts, tides = make_demo()
+        meteo = demo_meteo()
     else:
         try:
             forecasts = fetch_windguru(a.spot, a.debug or bool(a.inspect))
@@ -1212,10 +1362,11 @@ def main():
         if not forecasts:
             sys.exit("Aucune prévision Windguru reçue (relance avec --debug).")
         tides = get_tides(SPOT, tz, a.debug)
+        meteo = fetch_meteo(SPOT, a.debug)
 
     if a.inspect:
         inspect(forecasts, a.inspect)
-    days, tides_by_day = build_days(merge(forecasts, a.debug), tides)
+    days, tides_by_day = build_days(merge(forecasts, a.debug), tides, meteo=meteo)
     marc = {}
     if a.marc:
         today = datetime.now(tz).date()
