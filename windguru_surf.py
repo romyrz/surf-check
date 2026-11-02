@@ -236,6 +236,63 @@ def fetch_windguru(spot_id, debug=False, s=SPOT):
     return out
 
 
+WG_TIDES = {}
+
+
+def _to_dt(v):
+    """Horodatage Windguru (secondes, millisecondes ou texte) -> datetime UTC."""
+    if isinstance(v, (int, float)) and v > 1e9:
+        return datetime.fromtimestamp(v / 1000 if v > 1e11 else v, tz=timezone.utc)
+    if isinstance(v, str):
+        try:
+            d = datetime.fromisoformat(v.replace("Z", "+00:00").replace(" ", "T"))
+            return d if d.tzinfo else d.replace(tzinfo=ZoneInfo(SPOT["tz"]))
+        except ValueError:
+            return None
+    return None
+
+
+def parse_wg_tides(raw):
+    """Cherche dans la réponse marées de Windguru une série (heure, hauteur) et renvoie
+    la liste des pleines et basses mers [(datetime UTC, hauteur, "PM"/"BM")]."""
+    series = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            arrs = {k: v for k, v in o.items() if isinstance(v, list) and len(v) >= 3}
+            tkeys = [k for k, v in arrs.items() if _to_dt(v[0]) and _to_dt(v[-1])]
+            hkeys = [k for k, v in arrs.items() if all(isinstance(x, (int, float)) and abs(x) < 20 for x in v[:50])]
+            for tk in tkeys:
+                for hk in hkeys:
+                    if len(arrs[tk]) == len(arrs[hk]):
+                        series.append([(_to_dt(t), h) for t, h in zip(arrs[tk], arrs[hk])])
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            if o and all(isinstance(x, dict) for x in o[:5]):
+                keys = o[0].keys()
+                tk = next((k for k in keys if _to_dt(o[0].get(k))), None)
+                hk = next((k for k in keys if k != tk and isinstance(o[0].get(k), (int, float))
+                           and abs(o[0][k]) < 20), None)
+                if tk and hk:
+                    series.append([(_to_dt(x.get(tk)), x.get(hk)) for x in o])
+            for v in o:
+                walk(v)
+    walk(raw)
+    best = max(series, key=len, default=[])
+    best = sorted((t, h) for t, h in best if t and isinstance(h, (int, float)))
+    if len(best) < 4:
+        return []
+    gaps = [(b[0] - a[0]).total_seconds() for a, b in zip(best, best[1:])]
+    if sorted(gaps)[len(gaps) // 2] <= 3 * 3600:          # courbe : on en tire les extrêmes
+        return extremes([t for t, _ in best], [h for _, h in best])
+    out = []                                                # déjà une liste de PM / BM
+    for i, (t, h) in enumerate(best):
+        nb = [best[j][1] for j in (i - 1, i + 1) if 0 <= j < len(best)]
+        out.append((t, h, "PM" if all(h > x for x in nb) else "BM"))
+    return out
+
+
 def fetch_via_browser(spot_id, model, debug=False):
     """Ouvre la page Windguru du spot comme un visiteur et récupère la prévision du modèle
     demandé au moment où la page la charge (c’est ainsi que le tableau WG arrive à l’écran)."""
@@ -248,6 +305,11 @@ def fetch_via_browser(spot_id, model, debug=False):
 
     def on_response(resp):
         u = resp.url
+        if "tide" in u.lower() and "tides" not in got:
+            try:
+                got["tides"], got["tides_url"] = resp.json(), u
+            except Exception:
+                pass
         if ("iapi.php" in u and re.search(r"[?&]q=forecast(&|$)", u)
                 and re.search(rf"[?&]id_model={model}(&|$)", u) and "data" not in got):
             try:
@@ -263,12 +325,16 @@ def fetch_via_browser(spot_id, model, debug=False):
         try:
             page.goto(WG_PAGE.format(spot=spot_id), wait_until="domcontentloaded", timeout=60000)
             for _ in range(80):
-                if "data" in got:
+                if "data" in got and "tides" in got:
                     break
                 page.wait_for_timeout(500)
         except Exception as e:
             print(f"  page Windguru : échec ({str(e).splitlines()[0][:120]})")
         browser.close()
+    if "tides" in got:
+        WG_TIDES["raw"], WG_TIDES["url"] = got["tides"], got["tides_url"]
+        if debug:
+            print(f"  marées Windguru lues via la page : {got['tides_url']}")
     if "data" not in got:
         print(f"  modèle {model} introuvable dans les échanges de la page Windguru")
         return None
@@ -497,8 +563,11 @@ def extremes(times, levels):
 def tide_state(t, level, ex):
     prev = next((e for e in reversed(ex) if e[0] <= t), None)
     nxt = next((e for e in ex if e[0] > t), None)
-    if not prev or not nxt or level is None:
+    if not prev or not nxt:
         return None
+    if level is None:                                      # interpolation entre PM et BM
+        x = (t - prev[0]).total_seconds() / max(1, (nxt[0] - prev[0]).total_seconds())
+        level = prev[1] + (nxt[1] - prev[1]) * (1 - math.cos(math.pi * x)) / 2
     rising = nxt[2] == "PM"
     low, high = (prev[1], nxt[1]) if rising else (nxt[1], prev[1])
     f = min(1, max(0, (level - low) / (high - low))) if high > low else 0.5
@@ -541,6 +610,18 @@ def get_tides(s, tz, debug=False):
         ex = extremes(times, levels)
         bt, bh = fetch_marine(*BREST)
         coefs = coefficients(bt, bh["sea_level_height_msl"])
+        if WG_TIDES.get("raw") is not None:                   # horaires de Sainte-Barbe (Windguru)
+            wg_ex = parse_wg_tides(WG_TIDES["raw"])
+            if len(wg_ex) >= 4:
+                ex = wg_ex
+                local = {t: (None, v[1]) for t, v in local.items()}   # le niveau sera recalculé
+                print(f"Marées : horaires Windguru de Sainte-Barbe ({len(ex)} pleines/basses mers)")
+            else:
+                os.makedirs("site", exist_ok=True)
+                with open("site/windguru_tides.json", "w", encoding="utf-8") as f:
+                    json.dump(WG_TIDES["raw"], f, ensure_ascii=False, indent=1)
+                print("Marées : format Windguru non reconnu, modèle Open-Meteo utilisé "
+                      "(réponse enregistrée dans windguru_tides.json)")
         return local, ex, coefs
     except Exception as e:
         if debug:
@@ -682,22 +763,54 @@ ICON = {
 MAP_ICON = ('<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" '
             'stroke-linejoin="round"><path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2z"/><path d="M9 4v14M15 6v14"/></svg>')
 VIEWER_JS = """<script>
+function marcShow(b, scroll) {
+  var f = document.getElementById(b.dataset.target);
+  if (!f) return;
+  f.querySelector('img').src = b.dataset.src;
+  f.querySelectorAll('.mh').forEach(function (x) { x.textContent = b.dataset.h; });
+  f.querySelector('figcaption a').href = b.dataset.href;
+  var all = document.querySelectorAll('.mbtn[data-target="' + b.dataset.target + '"]');
+  all.forEach(function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });
+  var i = Array.prototype.indexOf.call(all, b);
+  f.querySelector('.mstep[data-step="-1"]').disabled = i <= 0;
+  f.querySelector('.mstep[data-step="1"]').disabled = i >= all.length - 1;
+  if (scroll) f.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
 document.querySelectorAll('.mbtn').forEach(function (b) {
-  b.addEventListener('click', function () {
-    var f = document.getElementById(b.dataset.target);
-    if (!f) return;
-    f.querySelector('img').src = b.dataset.src;
-    f.querySelector('.mh').textContent = b.dataset.h;
-    f.querySelector('a').href = b.dataset.href;
-    document.querySelectorAll('.mbtn[data-target="' + b.dataset.target + '"]').forEach(function (x) {
-      x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
+  b.addEventListener('click', function () { marcShow(b, true); });
+});
+document.querySelectorAll('.marcview').forEach(function (f) {
+  var all = function () { return document.querySelectorAll('.mbtn[data-target="' + f.id + '"]'); };
+  var cur = function () {
+    var a = all();
+    for (var i = 0; i < a.length; i++) if (a[i].getAttribute('aria-pressed') === 'true') return i;
+    return 0;
+  };
+  f.querySelectorAll('.mstep').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var a = all(), j = cur() + Number(btn.dataset.step);
+      if (j >= 0 && j < a.length) marcShow(a[j], false);
     });
-    f.scrollIntoView({behavior: 'smooth', block: 'nearest'});
   });
+  var a = all();
+  if (a.length) marcShow(a[cur()], false);
 });
 </script>"""
 STAR = ('<svg class="star" viewBox="0 0 24 24" aria-label="Exceptionnel"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 '
         '1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z"/></svg>')
+def two(long, short):
+    """Texte complet sur grand écran, version courte sur mobile."""
+    return f'<span class="lg">{long}</span><span class="sm">{short}</span>' if long != short else long
+
+
+SHORT_LABELS = {
+    "Vagues (m)": two("Vagues (m)", "Vag."), "Période (s)": two("Période (s)", "Pér."),
+    "Dir. vagues": two("Dir. vagues", "Dir."), "Vent (nds)": two("Vent (nds)", "Vent"),
+    "Rafales (nds)": two("Rafales (nds)", "Raf."), "Dir. vent": two("Dir. vent", "Dir."),
+    "Carte MARC": two("Carte MARC", "Carte"), "Air (°C)": two("Air (°C)", "Air"),
+    "Nuages (%)": two("Nuages (%)", "Nuag."),
+}
+TIDE_SHORT = {"pleine mer": "haute", "basse mer": "basse", "mi-marée": "mimar"}
 LABEL = {"top": "Top", "go": "GO", "ok": "Correct", "nul": "Nul"}
 
 CSS = """
@@ -759,6 +872,12 @@ position:sticky;top:calc(env(safe-area-inset-top,0px) + 10px)}
 .marcview img{display:block;width:100%;height:auto;border-radius:4px;background:#fff}
 .marcview figcaption{color:var(--muted);font-size:.9rem;margin-top:8px}
 .marcview figcaption a{color:var(--go)}
+.mnav{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:10px}
+.mnav .mh{font:600 1.3rem/1 "Barlow Condensed","Arial Narrow",sans-serif;min-width:3.2em;text-align:center}
+.mstep{width:44px;height:44px;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--go);
+font-size:1.7rem;line-height:1;cursor:pointer;display:grid;place-items:center;padding:0 0 4px}
+.mstep:hover:not(:disabled),.mstep:focus-visible{background:var(--go);color:var(--card);outline:none}
+.mstep:disabled{opacity:.3;cursor:default}
 .webcam .cam{position:relative;aspect-ratio:16/9;max-width:1100px;background:#000;border-radius:10px;overflow:hidden;
 border:1px solid var(--line)}
 .webcam .cam iframe,.webcam .cam video,.webcam .cam img{position:absolute;inset:0;width:100%;height:100%;border:0;object-fit:contain}
@@ -767,6 +886,15 @@ border:1px solid var(--line)}
 .off{color:var(--off)}.on{color:var(--on)}.side-shore{color:var(--side)}
 small{color:var(--muted)}
 td.hs,td.ws{font-weight:600}
+.sm{display:none}
+@media (max-width:700px){
+  .lg{display:none}.sm{display:inline}
+  th,td{padding:5px 5px;font-size:.84rem}
+  th{font-size:.78rem}
+  small.deg{display:none}
+  .ic{width:28px;height:28px}
+  td.veto{font-size:.62rem;white-space:normal;min-width:3.6em}
+}
 footer{color:var(--muted);font-size:.85rem;margin-top:40px}
 """
 
@@ -822,6 +950,15 @@ def wind_cell(kn):
             rgb = tuple(round(a + (b - a) * t) for a, b in zip(c0, c1))
             break
     return (f'<td class="ws" style="background:rgb{rgb};color:{_ink(*rgb)}">{kn}</td>')
+
+
+def clouds(r):
+    """Couverture nuageuse totale fournie par le modèle (TCDC). Si le modèle ne donne que
+    les couches hautes / moyennes / basses (comme le tableau WG), on prend la plus couverte."""
+    if r.get("TCDC") is not None:
+        return r["TCDC"]
+    layers = [r[k] for k in ("HCDC", "MCDC", "LCDC") if r.get(k) is not None]
+    return max(layers) if layers else None
 
 
 def arrow(deg):
@@ -907,6 +1044,7 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
         out.append("</tr></thead><tbody>")
 
         def row(label, cells, cls=""):
+            label = SHORT_LABELS.get(label, label)
             out.append(f'<tr class="{cls}"><th>{label}</th>' + "".join(cells) + "</tr>")
 
         row("", [f'<td class="{h["v"]}"><span class="vi">{ICON[h["v"]]}{STAR if h["star"] else ""}</span></td>'
@@ -916,7 +1054,7 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
         R = [h["r"] for h in hours]
         row("Vagues (m)", [houle_cell(r.get('HTSGW', r.get('SWELL1'))) for r in R])
         row("Période (s)", [f"<td>{fmt(r.get('PERPW', r.get('SWPER1')))}</td>" for r in R])
-        row("Dir. vagues", [f"<td>{arrow(r.get('DIRPW', r.get('SWDIR1')))} <small>{fmt(r.get('DIRPW', r.get('SWDIR1')))}°</small></td>" for r in R])
+        row("Dir. vagues", [f"<td>{arrow(r.get('DIRPW', r.get('SWDIR1')))} <small class=\"deg\">{fmt(r.get('DIRPW', r.get('SWDIR1')))}°</small></td>" for r in R])
         row("Vent (nds)", [wind_cell(r.get("WINDSPD")) for r in R])
         row("Rafales (nds)", [wind_cell(r.get("GUST")) for r in R])
         cells = []
@@ -924,9 +1062,13 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
             wd = r.get("WINDDIR")
             k = wind_kind(wd) if wd is not None else ""
             cls = {"offshore": "off", "onshore": "on"}.get(k, k)
-            cells.append(f'<td class="{cls}">{arrow(wd)} <small class="{cls}">{k.replace("-shore", "")}</small></td>')
+            short = {"offshore": "off", "onshore": "on", "side-shore": "side"}.get(k, "")
+            cells.append(f'<td class="{cls}">{arrow(wd)} <small class="{cls}">'
+                         f'{two(k.replace("-shore", ""), short)}</small></td>')
         row("Dir. vent", cells)
-        row("Marée", [f"<td>{('↗ ' if h['tide']['rising'] else '↘ ') + h['tide']['label']}</td>" if h["tide"] else "<td>–</td>" for h in hours])
+        row("Marée", [f"<td>{'↗' if h['tide']['rising'] else '↘'} "
+                      f"{two(h['tide']['label'], TIDE_SHORT[h['tide']['label']])}</td>"
+                      if h["tide"] else "<td>–</td>" for h in hours])
         viewer = ""
         if (day - now.date()).days < s["marc_days"]:
             vid = f"m{day:%m%d}"
@@ -945,15 +1087,20 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
             if with_img:
                 best = [h for h in with_img if h["v"] == v] or with_img
                 first = max(best, key=lambda h: h["score"])
+                cells_first = f'data-h="{first["t"]:%H}h"'
+                out[-1] = out[-1].replace(f'{cells_first} ', f'{cells_first} aria-pressed="true" ', 1)
                 viewer = (f'<figure class="marcview" id="{vid}"><img src="{marc_dir}/{marc[first["t"]]}" '
                           f'alt="Carte MARC des vagues" loading="lazy" width="748" height="576">'
-                          f'<figcaption>Hauteur et direction des vagues à <span class="mh">{first["t"]:%H}h</span>. '
-                          f'Clique sur une icône de carte dans le tableau pour changer d’heure. '
+                          f'<div class="mnav"><button type="button" class="mstep" data-step="-1" '
+                          f'aria-label="Heure précédente">‹</button>'
+                          f'<span class="mh" aria-live="polite">{first["t"]:%H}h</span>'
+                          f'<button type="button" class="mstep" data-step="1" aria-label="Heure suivante">›</button></div>'
+                          f'<figcaption>Hauteur et direction des vagues (MARC, Ifremer). '
                           f'<a href="{e(marc_link(first["t"], s))}" target="_blank" rel="noopener">Ouvrir sur MARC</a>'
                           f'</figcaption></figure>')
         row("Coef", [f"<td>{h['coef'] if h['coef'] else '–'}</td>" for h in hours])
         row("Air (°C)", [f"<td>{fmt(r.get('TMP'))}</td>" for r in R])
-        row("Nuages (%)", [f"<td>{fmt(r.get('TCDC'))}</td>" for r in R])
+        row("Nuages (%)", [f"<td>{fmt(clouds(r))}</td>" for r in R])
         out.append("</tbody></table></div></div></section>")
         out.insert(grid_at, ('<div class="daygrid">' + viewer) if viewer else '<div class="dayonly">')
 
