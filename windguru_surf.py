@@ -859,7 +859,15 @@ VIEWER_JS = """<script>
 function marcShow(b, scroll) {
   var f = document.getElementById(b.dataset.target);
   if (!f) return;
-  f.querySelector('img').src = b.dataset.src;
+  var img = f.querySelector('img');
+  img.removeAttribute('loading');            // certains navigateurs mobiles ignorent le changement
+  img.loading = 'eager';                     // d’image d’une image « lazy »
+  if (img.getAttribute('src') !== b.dataset.src) img.setAttribute('src', b.dataset.src);
+  var all0 = document.querySelectorAll('.mbtn[data-target="' + b.dataset.target + '"]');
+  var k = Array.prototype.indexOf.call(all0, b);
+  [k - 1, k + 1].forEach(function (j) {     // précharge les heures voisines
+    if (all0[j]) { var p = new Image(); p.src = all0[j].dataset.src; }
+  });
   f.querySelectorAll('.mh').forEach(function (x) { x.textContent = b.dataset.h; });
   f.querySelector('figcaption a').href = b.dataset.href;
   var all = document.querySelectorAll('.mbtn[data-target="' + b.dataset.target + '"]');
@@ -967,6 +975,21 @@ border-radius:10px;padding:12px 12px 10px}
 .day .n{color:var(--muted);font-size:.85rem}
 .day .ic{width:46px;height:46px;margin:8px 0 2px}
 .day .c{color:var(--muted);font-size:.85rem;margin-top:2px}
+.cal{display:none}
+@media (max-width:700px){
+  .week{display:none}
+  .cal{display:block;margin-bottom:26px}
+  .calrow{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin-bottom:4px}
+  .calhead div{text-align:center;font-size:.72rem;color:var(--muted);font-weight:600}
+  .cc{display:flex;flex-direction:column;align-items:center;gap:2px;padding:5px 1px 4px;min-height:74px;
+      background:var(--card);border:1px solid var(--line);border-radius:8px;text-decoration:none;color:inherit}
+  .cc.today{outline:2px solid var(--go);outline-offset:-1px}
+  .cc.off{background:transparent;border-style:dashed;opacity:.45}
+  .cc .cn{font-size:.7rem;color:var(--muted);white-space:nowrap}
+  .cc .ic{width:26px;height:26px}
+  .cc .star{width:13px;height:13px;top:-4px;right:-7px}
+  .cc .cw{font-size:.66rem;font-weight:600;white-space:nowrap;letter-spacing:-.02em}
+}
 .day .w{font-weight:600}.day .w.none{color:var(--muted);font-weight:400}
 .legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:.9rem;margin:-18px 0 30px}
 .legend span{display:flex;align-items:center;gap:6px}.legend .ic{width:22px;height:22px}
@@ -1000,7 +1023,7 @@ position:sticky;top:calc(env(safe-area-inset-top,0px) + 10px)}
 .marcview figcaption a{color:var(--go)}
 .mnav{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:10px}
 .mnav .mh{font:600 1.3rem/1 "Barlow Condensed","Arial Narrow",sans-serif;min-width:3.2em;text-align:center}
-.mstep{width:44px;height:44px;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--go);
+.mstep{touch-action:manipulation;-webkit-tap-highlight-color:transparent;width:44px;height:44px;border-radius:50%;border:1px solid var(--line);background:var(--card);color:var(--go);
 font-size:1.7rem;line-height:1;cursor:pointer;display:grid;place-items:center;padding:0 0 4px}
 .mstep:hover:not(:disabled),.mstep:focus-visible{background:var(--go);color:var(--card);outline:none}
 .mstep:disabled{opacity:.3;cursor:default}
@@ -1016,6 +1039,7 @@ td.hs,td.ws{font-weight:600}
 .wxi .s{stroke:var(--star)}.wxi .s circle{fill:color-mix(in srgb,var(--star) 22%,var(--card))}
 .wxi .c{stroke:var(--cloud);fill:var(--card)}.wxi .m{stroke:var(--moon);fill:color-mix(in srgb,var(--moon) 15%,var(--card))}
 .wxi .r{stroke:var(--rain)}.wxi .sn{stroke-width:2.6}.wxi .b{stroke:var(--star);stroke-width:2}
+td.wx{position:relative}
 td.wx.fz .wxi{opacity:.38;filter:grayscale(.6)}
 .legend .wxi{width:22px;height:22px}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
@@ -1105,6 +1129,42 @@ def fmt(v, f="{:.0f}"):
     return "–" if v is None else f.format(v)
 
 
+def _compact(win):
+    """« 07h–12h » -> « 7–12h », « 07h » -> « 7h »."""
+    if not win:
+        return ""
+    parts = [p.rstrip("h").lstrip("0") or "0" for p in win.split("–")]
+    return "–".join(parts) + "h"
+
+
+def render_calendar(cal, today):
+    """Vue mobile : semaines complètes du lundi au dimanche, jours hors prévision grisés."""
+    if not cal:
+        return ""
+    start = today - timedelta(days=today.weekday())
+    last = max(cal)
+    weeks = max(3, (last - start).days // 7 + 1)
+    out = ['<div class="cal" role="table" aria-label="Calendrier des conditions">',
+           '<div class="calrow calhead" role="row">']
+    out += [f'<div role="columnheader">{j[:2].capitalize()}</div>' for j in JOURS]
+    out.append("</div>")
+    for w in range(weeks):
+        out.append('<div class="calrow" role="row">')
+        for d in range(7):
+            day = start + timedelta(days=7 * w + d)
+            num = f"{day.day}" + (f" {MOIS_C[day.month - 1]}" if day.day == 1 or (w == 0 and d == 0) else "")
+            if day in cal:
+                v, win, star = cal[day]
+                out.append(f'<a class="cc{" today" if day == today else ""}" role="cell" href="#j{day:%m%d}">'
+                           f'<span class="cn">{num}</span><span class="vi">{ICON[v]}{STAR if star else ""}</span>'
+                           f'<span class="cw">{_compact(win) if win else "–"}</span></a>')
+            else:
+                out.append(f'<div class="cc off" role="cell"><span class="cn">{num}</span></div>')
+        out.append("</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
 def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="marc", webcam=None):
     marc = marc or {}
     tz = ZoneInfo(s["tz"])
@@ -1120,17 +1180,20 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
            f'<p class="sub">Mis à jour le {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} à {now:%H:%M}'
            + ('<span class="demo">données fictives</span>' if demo else "") + "</p>",
            '<div class="week">']
+    cal = {}
     summary = {}
     for day, hours in days.items():
         v, win = best_window(hours)
         star = any(h["star"] for h in hours)
         summary[day] = (v, win, star)
+        cal[day] = (v, win, star)
         cs = [c for _, k, c in tides_by_day.get(day, []) if k == "PM" and c]
         ctxt = f'<div class="c">coef {"/".join(map(str, cs))}</div>' if cs else ""
         out.append(f'<a class="day" href="#j{day:%m%d}"><div class="d">{JOURS[day.weekday()][:3]}.</div>'
                    f'<div class="n">{day.day} {MOIS_C[day.month - 1]}</div><span class="vi">{ICON[v]}{STAR if star else ""}</span>'
                    + (f'<div class="w">{win}</div>' if win else '<div class="w none">rien de bon</div>') + ctxt + "</a>")
     out.append("</div>")
+    out.append(render_calendar(cal, now.date()))
     out.append('<div class="legend">'
                f'<span>{ICON["top"]} Top (8,5/10 et plus)</span>'
                f'<span>{ICON["go"]} GO (7 à 8,5)</span>'
@@ -1224,7 +1287,7 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
                 cells_first = f'data-h="{first["t"]:%H}h"'
                 out[-1] = out[-1].replace(f'{cells_first} ', f'{cells_first} aria-pressed="true" ', 1)
                 viewer = (f'<figure class="marcview" id="{vid}"><img src="{marc_dir}/{marc[first["t"]]}" '
-                          f'alt="Carte MARC des vagues" loading="lazy" width="748" height="576">'
+                          f'alt="Carte MARC des vagues" width="748" height="576">'
                           f'<div class="mnav"><button type="button" class="mstep" data-step="-1" '
                           f'aria-label="Heure précédente">‹</button>'
                           f'<span class="mh" aria-live="polite">{first["t"]:%H}h</span>'
