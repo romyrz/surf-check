@@ -400,6 +400,66 @@ def capture_marc(slots, out_dir, s=SPOT, debug=False):
     print(f"Cartes MARC : {len(done)}/{len(slots)} récupérées")
     return done
 
+# =============================================================== WEBCAM BARRE D’ETEL
+
+WEBCAM_PAGE = "https://www.mairie-etel.fr/webcam-la-barre-detel-live"
+WEBCAM_NOISE = ("google", "facebook", "twitter", "doubleclick", "recaptcha", "tarteaucitron",
+                "matomo", "analytics", "about:blank", "mairie-etel.fr", "addthis", "sharethis")
+
+
+def find_webcam(out_dir, debug=False):
+    """Ouvre la page webcam de la mairie, repère le lecteur vidéo intégré (iframe ou vidéo)
+    et en garde l’adresse ; prend aussi une photo du lecteur en secours."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {}
+    os.makedirs(out_dir, exist_ok=True)
+    res = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(locale="fr-FR", user_agent=HEADERS["User-Agent"],
+                                viewport={"width": 1400, "height": 1100})
+        try:
+            page.goto(WEBCAM_PAGE, wait_until="load", timeout=60000)
+            for label in ("Tout accepter", "Accepter", "J’accepte", "J'accepte", "OK, tout accepter",
+                          "Autoriser", "Accept all"):
+                try:
+                    page.get_by_role("button", name=label).first.click(timeout=1500)
+                    break
+                except Exception:
+                    pass
+            page.wait_for_timeout(6000)
+            found = page.evaluate("""() => [...document.querySelectorAll('iframe, video')].map(e => {
+                const r = e.getBoundingClientRect();
+                return {tag: e.tagName.toLowerCase(), src: e.currentSrc || e.src || e.getAttribute('data-src') || '',
+                        area: r.width * r.height};
+            })""")
+            if debug:
+                print(f"  webcam : éléments trouvés {found}")
+            cands = [f for f in found if f["src"].startswith("http")
+                     and not any(n in f["src"] for n in WEBCAM_NOISE)]
+            cands.sort(key=lambda f: -f["area"])
+            if cands:
+                res["src"], res["tag"] = cands[0]["src"], cands[0]["tag"]
+                print(f"Webcam : lecteur trouvé ({res['tag']}) {res['src']}")
+                el = page.locator(f"{res['tag']}[src='{res['src']}']").first
+                try:
+                    el.scroll_into_view_if_needed(timeout=5000)
+                    page.wait_for_timeout(1500)
+                    el.screenshot(path=os.path.join(out_dir, "webcam.jpg"), type="jpeg", quality=80)
+                    res["img"] = "webcam.jpg"
+                except Exception:
+                    pass
+            else:
+                print("Webcam : aucun lecteur repéré sur la page de la mairie.")
+                page.screenshot(path=os.path.join(out_dir, "webcam_page.jpg"), type="jpeg", quality=70,
+                                full_page=True)
+        except Exception as e:
+            print(f"Webcam : échec ({str(e).splitlines()[0][:120]})")
+        browser.close()
+    return res
+
 # =============================================================== MARÉES
 
 
@@ -699,6 +759,10 @@ position:sticky;top:calc(env(safe-area-inset-top,0px) + 10px)}
 .marcview img{display:block;width:100%;height:auto;border-radius:4px;background:#fff}
 .marcview figcaption{color:var(--muted);font-size:.9rem;margin-top:8px}
 .marcview figcaption a{color:var(--go)}
+.webcam .cam{position:relative;aspect-ratio:16/9;max-width:1100px;background:#000;border-radius:10px;overflow:hidden;
+border:1px solid var(--line)}
+.webcam .cam iframe,.webcam .cam video,.webcam .cam img{position:absolute;inset:0;width:100%;height:100%;border:0;object-fit:contain}
+.webcam .meta{margin-top:8px}.webcam .meta a{color:var(--go)}
 .ar{display:inline-block;font-size:1rem;line-height:1}
 .off{color:var(--off)}.on{color:var(--on)}.side-shore{color:var(--side)}
 small{color:var(--muted)}
@@ -771,7 +835,7 @@ def fmt(v, f="{:.0f}"):
     return "–" if v is None else f.format(v)
 
 
-def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="marc"):
+def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="marc", webcam=None):
     marc = marc or {}
     tz = ZoneInfo(s["tz"])
     now = datetime.now(tz)
@@ -803,6 +867,19 @@ def render_html(days, tides_by_day, s=SPOT, demo=False, marc=None, marc_dir="mar
                f'<span>{ICON["ok"]} Correct (5 à 7)</span>'
                f'<span>{ICON["nul"]} Nul (moins de 5, ou vagues &lt; 0,6 m, période &lt; 8 s, vent &gt; 20 nds)</span>'
                f'<span><span class="vi">{STAR}</span> Exceptionnel (plus de 9/10)</span></div>')
+
+    cam = webcam or {}
+    out.append('<section class="webcam" id="webcam"><h2>Webcam live barre d’Etel</h2>')
+    if cam.get("src") and cam.get("tag") == "iframe":
+        out.append(f'<div class="cam"><iframe src="{e(cam["src"])}" title="Webcam live de la barre d’Etel" '
+                   'loading="lazy" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe></div>')
+    elif cam.get("src") and cam.get("tag") == "video":
+        out.append(f'<div class="cam"><video src="{e(cam["src"])}" controls autoplay muted playsinline'
+                   + (f' poster="{cam["img"]}"' if cam.get("img") else "") + '></video></div>')
+    elif cam.get("img"):
+        out.append(f'<div class="cam"><img src="{cam["img"]}" alt="Image de la webcam de la barre d’Etel"></div>')
+    out.append(f'<p class="meta">Si le direct ne s’affiche pas, <a href="{WEBCAM_PAGE}" target="_blank" '
+               'rel="noopener">ouvre la webcam sur le site de la mairie d’Etel</a>.</p></section>')
 
     for day, hours in days.items():
         v, win, _ = summary[day]
@@ -972,6 +1049,7 @@ def main():
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--marc", action="store_true", help="photographier les cartes MARC (Ifremer)")
+    ap.add_argument("--webcam", action="store_true", help="intégrer la webcam de la barre d’Etel")
     ap.add_argument("--inspect", default=os.getenv("INSPECT", ""),
                     help='détail des modèles pour une heure, ex. "2026-10-31 10"')
     a = ap.parse_args()
@@ -996,7 +1074,8 @@ def main():
         today = datetime.now(tz).date()
         slots = [h["t"] for d, hs in days.items() if (d - today).days < SPOT["marc_days"] for h in hs]
         marc = capture_marc(slots, os.path.join(os.path.dirname(a.out) or ".", "marc"), debug=a.debug)
-    page, summary = render_html(days, tides_by_day, demo=a.demo, marc=marc)
+    webcam = find_webcam(os.path.dirname(a.out) or ".", a.debug) if a.webcam else {}
+    page, summary = render_html(days, tides_by_day, demo=a.demo, marc=marc, webcam=webcam)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(page)
